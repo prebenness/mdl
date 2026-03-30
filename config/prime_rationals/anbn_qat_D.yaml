@@ -1,0 +1,30 @@
+# QAT ablation D: combined (STE rounding + integer-attraction penalty)
+# Full QAT pipeline with both rounding schedule and attraction penalty.
+task: anbn
+P: 6
+hidden_size: 3
+lambda_mdl: 100.0
+lr: 0.01
+epochs: 10000
+seed: 42
+init_std: 0.01
+clamp_logmag: 10.0
+eval_every: 200
+log_every: 200
+
+# ANBN-specific
+num_train: 1000
+p: 0.3
+data_seed: 0
+test_max_n: 1500
+
+# QAT: combined
+qat_enabled: true
+int_attraction_mu_max: 0.001
+round_warmup_frac: 0.2
+freeze_frac: 0.95
+mu_start_frac: 0.1
+mu_full_frac: 0.5
+E_max: 6.0
+lr_drop_at_switch: 0.5
+grad_clip_norm: 1.0

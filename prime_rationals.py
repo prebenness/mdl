@@ -87,7 +87,36 @@ def get_log_primes(P: int) -> jnp.ndarray:
     return jnp.array([math.log(p) for p in first_primes(P)], dtype=jnp.float32)
 
 
-def reconstruct_weight(z, u, log_primes, clamp_val=10.0):
+# ===========================================================================
+# QAT utilities
+# ===========================================================================
+
+def round_ste(z):
+    """Straight-through estimator rounding.
+
+    Forward pass returns round(z); backward pass treats this as identity
+    (gradient flows through as if no rounding happened).
+    """
+    return z + jax.lax.stop_gradient(jnp.round(z) - z)
+
+
+def integer_attraction_penalty(z):
+    """Smooth penalty that is zero at integers, maximal at half-integers.
+
+    Uses sin^2(pi * z) which has gradient 2*pi*sin(pi*z)*cos(pi*z) everywhere.
+    """
+    return jnp.mean(jnp.sin(math.pi * z) ** 2)
+
+
+def integer_distance_penalty(z):
+    """Alternative integer penalty: mean squared distance to nearest integer.
+
+    Useful for ablation against sin^2 penalty.
+    """
+    return jnp.mean((z - jnp.round(z)) ** 2)
+
+
+def reconstruct_weight(z, u, log_primes, clamp_val=10.0, mode="continuous"):
     """Reconstruct weight from exponent coordinates and sign parameter.
 
     Args:
@@ -95,11 +124,20 @@ def reconstruct_weight(z, u, log_primes, clamp_val=10.0):
         u: (...) sign parameters.
         log_primes: (P,) log of prime basis.
         clamp_val: clamp range for log-magnitude.
+        mode: "continuous" (default, current behavior),
+              "rounded" (STE rounding — integer forward, identity backward),
+              "frozen_rounded" (hard rounding, no gradient through z).
 
     Returns:
         weight: (...) reconstructed weights.
     """
-    logmag = jnp.sum(z * log_primes, axis=-1)
+    if mode == "rounded":
+        z_eff = round_ste(z)
+    elif mode == "frozen_rounded":
+        z_eff = jax.lax.stop_gradient(jnp.round(z))
+    else:
+        z_eff = z
+    logmag = jnp.sum(z_eff * log_primes, axis=-1)
     logmag = jnp.clip(logmag, -clamp_val, clamp_val)
     sign = jnp.tanh(u)
     return sign * jnp.exp(logmag)
@@ -116,6 +154,125 @@ def compute_mdl_penalty(z, log_primes):
         Scalar penalty.
     """
     return jnp.sum(jnp.abs(z) * log_primes)
+
+
+# ===========================================================================
+# QAT schedule & diagnostics
+# ===========================================================================
+
+def get_forward_mode(frac, round_warmup_frac=0.2, freeze_frac=0.95):
+    """Return forward-pass mode based on training progress fraction.
+
+    Args:
+        frac: training progress in [0, 1].
+        round_warmup_frac: fraction before which we stay continuous.
+        freeze_frac: fraction after which we freeze (no gradient through z).
+
+    Returns:
+        One of "continuous", "rounded", "frozen_rounded".
+    """
+    if frac < round_warmup_frac:
+        return "continuous"
+    elif frac < freeze_frac:
+        return "rounded"
+    else:
+        return "frozen_rounded"
+
+
+def get_integer_mu(frac, mu_max, mu_start_frac=0.1, mu_full_frac=0.5):
+    """Return integer-attraction penalty weight based on training progress.
+
+    Linearly ramps from 0 to mu_max between mu_start_frac and mu_full_frac.
+
+    Args:
+        frac: training progress in [0, 1].
+        mu_max: maximum penalty weight.
+        mu_start_frac: fraction at which penalty begins.
+        mu_full_frac: fraction at which penalty reaches mu_max.
+
+    Returns:
+        Scalar penalty weight.
+    """
+    if frac < mu_start_frac:
+        return 0.0
+    elif frac < mu_full_frac:
+        return mu_max * (frac - mu_start_frac) / (mu_full_frac - mu_start_frac)
+    else:
+        return mu_max
+
+
+def compute_qat_diagnostics(params, P):
+    """Compute QAT diagnostics across all z_* tensors in a params tree.
+
+    Returns dict with:
+        d_int: mean |z - round(z)|
+        d_logw: mean |sum_r (z_r - round(z_r)) * log(p_r)|
+        f_eps_01: fraction of exponents within 0.1 of an integer
+        f_eps_005: fraction within 0.05 of an integer
+        int_penalty: mean sin^2(pi * z)
+    """
+    log_primes = get_log_primes(P)
+    all_z = []
+
+    def traverse(d):
+        for k, v in d.items():
+            if isinstance(v, dict):
+                traverse(v)
+            elif 'z_' in k:
+                all_z.append(v.reshape(-1, v.shape[-1]))
+
+    traverse(params)
+
+    if not all_z:
+        return {
+            "d_int": 0.0, "d_logw": 0.0,
+            "f_eps_01": 1.0, "f_eps_005": 1.0, "int_penalty": 0.0,
+        }
+
+    z_all = jnp.concatenate(all_z, axis=0)  # (N, P)
+    residual = z_all - jnp.round(z_all)  # (N, P)
+    abs_residual = jnp.abs(residual)
+
+    # d_int: mean absolute distance to nearest integer (over all elements)
+    d_int = float(jnp.mean(abs_residual))
+
+    # d_logw: mean |sum_r residual_r * log(p_r)| per weight
+    logw_residual = jnp.sum(residual * log_primes, axis=-1)  # (N,)
+    d_logw = float(jnp.mean(jnp.abs(logw_residual)))
+
+    # fraction within epsilon of integer
+    f_eps_01 = float(jnp.mean(abs_residual < 0.1))
+    f_eps_005 = float(jnp.mean(abs_residual < 0.05))
+
+    # integer penalty: sin^2(pi * z)
+    int_penalty = float(jnp.mean(jnp.sin(math.pi * z_all) ** 2))
+
+    return {
+        "d_int": d_int,
+        "d_logw": d_logw,
+        "f_eps_01": f_eps_01,
+        "f_eps_005": f_eps_005,
+        "int_penalty": int_penalty,
+    }
+
+
+def clamp_exponents_in_params(params, E_max):
+    """Clamp all z_* parameters in a params tree to [-E_max, E_max].
+
+    Returns new params dict with clamped exponents.
+    """
+    def traverse(d):
+        out = {}
+        for k, v in d.items():
+            if isinstance(v, dict):
+                out[k] = traverse(v)
+            elif 'z_' in k:
+                out[k] = jnp.clip(v, -E_max, E_max)
+            else:
+                out[k] = v
+        return out
+
+    return traverse(params)
 
 
 def discretize(z, u):
@@ -215,7 +372,7 @@ class PrimeExpLinear(nn.Module):
     use_bias: bool = True
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, mode="continuous"):
         in_features = x.shape[-1]
         log_primes = get_log_primes(self.P)
 
@@ -223,7 +380,7 @@ class PrimeExpLinear(nn.Module):
                          (self.features, in_features, self.P))
         u_w = self.param('u_weight', _normal_init(self.init_std),
                          (self.features, in_features))
-        W = reconstruct_weight(z_w, u_w, log_primes, self.clamp_logmag)
+        W = reconstruct_weight(z_w, u_w, log_primes, self.clamp_logmag, mode=mode)
         out = x @ W.T
 
         if self.use_bias:
@@ -231,7 +388,7 @@ class PrimeExpLinear(nn.Module):
                              (self.features, self.P))
             u_b = self.param('u_bias', _normal_init(self.init_std),
                              (self.features,))
-            b = reconstruct_weight(z_b, u_b, log_primes, self.clamp_logmag)
+            b = reconstruct_weight(z_b, u_b, log_primes, self.clamp_logmag, mode=mode)
             out = out + b
 
         return out
@@ -246,14 +403,14 @@ class PrimeExpMLP(nn.Module):
     clamp_logmag: float = 10.0
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, mode="continuous"):
         x = PrimeExpLinear(self.hidden_dim, P=self.P,
                            init_std=self.init_std,
-                           clamp_logmag=self.clamp_logmag)(x)
+                           clamp_logmag=self.clamp_logmag)(x, mode=mode)
         x = nn.relu(x)
         x = PrimeExpLinear(self.output_dim, P=self.P,
                            init_std=self.init_std,
-                           clamp_logmag=self.clamp_logmag)(x)
+                           clamp_logmag=self.clamp_logmag)(x, mode=mode)
         return x
 
 
@@ -272,7 +429,7 @@ class PrimeExpLSTM(nn.Module):
     clamp_logmag: float = 10.0
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, mode="continuous"):
         B, T = x.shape
         H = self.hidden_size
         I = self.input_size
@@ -292,7 +449,7 @@ class PrimeExpLSTM(nn.Module):
         u = self.param('u_signs', _normal_init(self.init_std),
                        (n_total,))
 
-        all_weights = reconstruct_weight(z, u, log_primes, self.clamp_logmag)
+        all_weights = reconstruct_weight(z, u, log_primes, self.clamp_logmag, mode=mode)
 
         # --- Unpack weights (identical layout to GumbelSoftmaxLSTM) ---
         offset = 0
@@ -559,6 +716,55 @@ def make_anbn_train_step(lambda_mdl, n_train, P):
             }
 
         (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+        state = state.apply_gradients(grads=grads)
+        return state, loss, aux
+
+    return train_step
+
+
+def make_anbn_qat_train_step(lambda_mdl, n_train, P, mode, mu,
+                              grad_clip_norm=1.0):
+    """Create JIT-compiled ANBN training step with QAT support.
+
+    Args:
+        lambda_mdl: MDL regularization weight.
+        n_train: number of training strings (for MDL normalization).
+        P: number of primes.
+        mode: "continuous", "rounded", or "frozen_rounded".
+        mu: integer-attraction penalty weight.
+        grad_clip_norm: max gradient norm for clipping (0 = disabled).
+    """
+    log_primes = get_log_primes(P)
+
+    @jax.jit
+    def train_step(state, x, y, mask):
+        def loss_fn(params):
+            logits, aux = state.apply_fn({"params": params}, x, mode=mode)
+            data_nll = cross_entropy_bits(logits, y, mask)
+            mdl_reg = aux["mdl_penalty"]
+            loss = data_nll + (lambda_mdl / n_train) * mdl_reg
+
+            # Add integer-attraction penalty if mu > 0
+            if mu > 0.0:
+                z = aux["z_exponents"]
+                int_pen = integer_attraction_penalty(z)
+                loss = loss + mu * int_pen
+            else:
+                int_pen = 0.0
+
+            return loss, {
+                "data_nll": data_nll,
+                "mdl_reg": mdl_reg,
+                "int_pen": int_pen,
+                "mode": mode,
+            }
+
+        (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+        # Gradient clipping
+        if grad_clip_norm > 0:
+            g_norm = optax.global_norm(grads)
+            scale = jnp.minimum(1.0, grad_clip_norm / jnp.maximum(g_norm, 1e-8))
+            grads = jax.tree.map(lambda g: g * scale, grads)
         state = state.apply_gradients(grads=grads)
         return state, loss, aux
 
@@ -1078,7 +1284,28 @@ def run_anbn_experiment(config):
     print(f"Model parameters: {n_model_params} "
           f"(108 weights x P={config.P} exponents + 108 signs)")
 
-    train_step = make_anbn_train_step(config.lambda_mdl, n_train, config.P)
+    # --- Build train steps ---
+    if not config.qat_enabled:
+        train_step = make_anbn_train_step(config.lambda_mdl, n_train, config.P)
+    else:
+        # Pre-create JIT'd train steps for each QAT mode.
+        # mu is baked into each step, so we cache them keyed by (mode, mu_bucket).
+        # We rebuild when mu changes significantly (bucket by 0.01 increments).
+        _qat_step_cache = {}
+
+        def _get_qat_step(mode, mu):
+            mu_bucket = round(mu, 4)
+            key = (mode, mu_bucket)
+            if key not in _qat_step_cache:
+                _qat_step_cache[key] = make_anbn_qat_train_step(
+                    config.lambda_mdl, n_train, config.P, mode, mu_bucket,
+                    grad_clip_norm=config.grad_clip_norm,
+                )
+            return _qat_step_cache[key]
+
+        print(f"QAT enabled: round_warmup={config.round_warmup_frac}, "
+              f"freeze={config.freeze_frac}, "
+              f"mu_max={config.int_attraction_mu_max}")
 
     # --- Training loop ---
     t0 = time.monotonic()
@@ -1090,16 +1317,54 @@ def run_anbn_experiment(config):
     best_epoch = 0
     epochs_since_best = 0
     n_restarts = 0
+    prev_mode = None
+    current_lr = config.lr
 
     for epoch in range(1, config.epochs + 1):
-        state, loss, aux = train_step(state, x_train, y_train, mask_train)
+        if config.qat_enabled:
+            frac = (epoch - 1) / max(config.epochs - 1, 1)
+            mode = get_forward_mode(frac, config.round_warmup_frac,
+                                    config.freeze_frac)
+            mu = get_integer_mu(frac, config.int_attraction_mu_max,
+                                config.mu_start_frac, config.mu_full_frac)
+
+            # LR drop at mode boundaries
+            if prev_mode is not None and mode != prev_mode:
+                current_lr *= config.lr_drop_at_switch
+                tx = optax.adam(current_lr)
+                state = train_state.TrainState.create(
+                    apply_fn=model.apply, params=state.params, tx=tx,
+                )
+                print(f"  [QAT] mode switch {prev_mode} -> {mode} at epoch {epoch}, "
+                      f"lr -> {current_lr:.2e}")
+            prev_mode = mode
+
+            qat_step = _get_qat_step(mode, mu)
+            state, loss, aux = qat_step(state, x_train, y_train, mask_train)
+
+            # Clamp exponents after each step
+            if config.E_max > 0:
+                state = state.replace(
+                    params=clamp_exponents_in_params(state.params, config.E_max),
+                )
+        else:
+            state, loss, aux = train_step(state, x_train, y_train, mask_train)
 
         if epoch % config.log_every == 0 or epoch == 1:
             elapsed = time.monotonic() - t0
-            print(f"  epoch {epoch:5d} | loss={float(loss):.6f} | "
-                  f"nll={float(aux['data_nll']):.4f} bits | "
-                  f"mdl={float(aux['mdl_reg']):.2f} | "
-                  f"time={elapsed:.1f}s")
+            log_parts = [
+                f"  epoch {epoch:5d}",
+                f"loss={float(loss):.6f}",
+                f"nll={float(aux['data_nll']):.4f} bits",
+                f"mdl={float(aux['mdl_reg']):.2f}",
+            ]
+            if config.qat_enabled:
+                log_parts.append(f"mode={mode}")
+                log_parts.append(f"mu={mu:.4f}")
+                if mu > 0:
+                    log_parts.append(f"int_pen={float(aux.get('int_pen', 0)):.4f}")
+            log_parts.append(f"time={elapsed:.1f}s")
+            print(" | ".join(log_parts))
 
         if epoch % config.eval_every == 0 or epoch == config.epochs:
             val_result = evaluate_anbn_accuracy(
@@ -1118,10 +1383,24 @@ def run_anbn_experiment(config):
             )
             best_tag = "  * NEW BEST" if is_best else ""
 
-            print(f"  [val] acc={val_result['mean_accuracy']:.4f} | "
-                  f"n_perfect={n_perfect}/{n_val} | "
-                  f"gen_n={gen_n} | "
-                  f"mdl={current_complexity:.2f}{best_tag}")
+            val_parts = [
+                f"  [val] acc={val_result['mean_accuracy']:.4f}",
+                f"n_perfect={n_perfect}/{n_val}",
+                f"gen_n={gen_n}",
+                f"mdl={current_complexity:.2f}{best_tag}",
+            ]
+
+            # QAT diagnostics at eval time
+            if config.qat_enabled:
+                diag = compute_qat_diagnostics(state.params, config.P)
+                val_parts.append(
+                    f"d_int={diag['d_int']:.4f}"
+                )
+                val_parts.append(
+                    f"f<0.1={diag['f_eps_01']:.2%}"
+                )
+
+            print(" | ".join(val_parts))
 
             if is_best:
                 best_val_n_perfect = n_perfect
@@ -1220,6 +1499,18 @@ def run_anbn_experiment(config):
           f"max|z|={np.max(np.abs(z)):.4f}, "
           f"near-zero (<0.1): {np.mean(np.abs(z) < 0.1)*100:.1f}%")
 
+    # QAT diagnostics
+    if config.qat_enabled:
+        print("\n" + "=" * 60)
+        print("QAT Diagnostics (best params)")
+        print("=" * 60)
+        diag = compute_qat_diagnostics(best_params, config.P)
+        print(f"  d_int (mean |z - round(z)|): {diag['d_int']:.6f}")
+        print(f"  d_logw (mean |delta logw|):  {diag['d_logw']:.6f}")
+        print(f"  f_eps<0.10:                  {diag['f_eps_01']:.2%}")
+        print(f"  f_eps<0.05:                  {diag['f_eps_005']:.2%}")
+        print(f"  int_penalty (sin^2):         {diag['int_penalty']:.6f}")
+
     # --- Save results ---
     results = {
         "best_epoch": best_epoch,
@@ -1237,6 +1528,8 @@ def run_anbn_experiment(config):
         "disc_test_dh_bits": disc_test_dh["data_dh_bits"],
         "disc_h_bits": disc_h_bits,
     }
+    if config.qat_enabled:
+        results["qat_diagnostics"] = diag
     save_results(run_dir, results)
 
     print(f"\nResults saved to {run_dir}")
@@ -1461,6 +1754,17 @@ class PrimeRationalConfig:
     # Training schedule
     restart_patience: int = 0
 
+    # QAT (quantization-aware training)
+    qat_enabled: bool = False
+    int_attraction_mu_max: float = 0.0
+    round_warmup_frac: float = 0.2
+    freeze_frac: float = 0.95
+    mu_start_frac: float = 0.1
+    mu_full_frac: float = 0.5
+    E_max: float = 6.0
+    lr_drop_at_switch: float = 0.5
+    grad_clip_norm: float = 1.0
+
     # Baseline-specific
     reg: str = "none"
 
@@ -1529,6 +1833,26 @@ def _build_arg_parser(defaults=None):
                              "checkpoint (0 = disabled)")
     parser.add_argument("--deterministic", action="store_true",
                         help="Force deterministic GPU ops")
+    # QAT (quantization-aware training)
+    parser.add_argument("--qat_enabled", type=lambda v: v if isinstance(v, bool) else v.lower() in ('true', '1', 'yes'),
+                        default=False,
+                        help="Enable quantization-aware training")
+    parser.add_argument("--int_attraction_mu_max", type=float, default=0.0,
+                        help="Max weight for integer-attraction penalty")
+    parser.add_argument("--round_warmup_frac", type=float, default=0.2,
+                        help="Training fraction before STE rounding begins")
+    parser.add_argument("--freeze_frac", type=float, default=0.95,
+                        help="Training fraction after which exponents are frozen")
+    parser.add_argument("--mu_start_frac", type=float, default=0.1,
+                        help="Training fraction at which int-attraction begins")
+    parser.add_argument("--mu_full_frac", type=float, default=0.5,
+                        help="Training fraction at which int-attraction reaches max")
+    parser.add_argument("--E_max", type=float, default=6.0,
+                        help="Clamp exponents to [-E_max, E_max] (0 = disabled)")
+    parser.add_argument("--lr_drop_at_switch", type=float, default=0.5,
+                        help="LR multiplier when switching QAT mode")
+    parser.add_argument("--grad_clip_norm", type=float, default=1.0,
+                        help="Max gradient norm for clipping (0 = disabled)")
     # Baseline-specific
     parser.add_argument("--reg", type=str, default="none",
                         choices=["none", "l1", "l2"],
