@@ -1,0 +1,14 @@
+# Virtual environments
+venv/
+venvs/
+
+__pycache__/
+.vscode/
+.claude/
+.pytest_cache/
+
+# Data and results
+data/
+wandb/
+logs/
+results/
