@@ -1,12 +1,13 @@
 # Project Roadmap
 
-Consolidated from `code-cleanup-todos.MD`, `research-roadmap.MD`, and `experiment-and-metrics-roadmap.MD`. Updated 2026-03-21.
+Consolidated from `code-cleanup-todos.MD`, `research-roadmap.MD`, and `experiment-and-metrics-roadmap.MD`. Updated 2026-03-30.
 
 **Reference papers:**
 - Lan et al. (2024), "MDL Regularization of LSTM Language Models for Formal Language Learning", ACL 2024: `agent-context/arxiv/arXiv-2402.10013v2_contents/main-acl.tex`
 - Abudy et al. (2025), "Learning Formal Languages with Small RNNs Using MDL Regularization", NeurIPS 2025 submission: `agent-context/arxiv/arXiv-2505.13398v2_contents/main.tex`
 - Lan, Chemla & Katzir (2022), "Minimum description length recurrent neural networks", TACL 10:785–799: `agent-context/arxiv/arXiv-2111.00600v4_contents/main-3649-Lan.tex`
 - Weiss, Goldberg & Yahav (2018), "On the Practical Computational Power of Finite Precision RNNs for Language Recognition", ACL 2018 Short: `agent-context/arxiv/arXiv-1805.04908v1_contents/`
+- Ghaffari et al. (2022), "Is Integer Arithmetic Enough for Deep Learning Training?", NeurIPS 2022, arXiv:2207.08822: `agent-context/arxiv/` (integer-arithmetic training method)
 
 **Fair comparison analysis:** `docs/comparisons.md` — detailed comparison targets, golden network discrepancies, threats to validity, and implementation tasks for apples-to-apples reporting.
 
@@ -88,6 +89,14 @@ Items requiring new code, new experimental infrastructure, or new research direc
 #### ~~Staged temperature annealing with discretization checkpoints~~ — Done (2026-03-21)
 
 Implemented in `src/mdl/training.py` and `differentiable_mdl.py`. Extended `MDLTrainState` with `freeze_mask` (n_params,) float32. New functions: `compute_confidence_mask`, `freeze_confident_weights` (one-hot × 100 logits), `apply_freeze_mask_to_grads` (gradient masking). `make_train_step` gains `use_freeze_mask` parameter. CLI args: `--anneal_mode staged`, `--staged_tau_levels`, `--staged_epoch_fracs`, `--freeze_threshold`. Tests in `tests/test_staged_annealing.py`.
+
+#### ~~QAT + Integer-Attraction Penalty for Prime-Exponent MDL~~ — Done (2026-03-30)
+
+Implemented in `prime_rationals.py`. Adds quantization-aware training (rounded-forward exponents via STE), integer-attraction penalty (`sin^2(pi*z)`), phased training schedule (continuous warm-start → STE-rounded → frozen hardening), exponent clamping, and full QAT diagnostics. All Flax modules (`PrimeExpLinear`, `PrimeExpMLP`, `PrimeExpLSTM`) gain `mode` parameter. 9 new config fields, backward compatible when `qat_enabled=False`. 4 ablation configs (`anbn_qat_{A,B,C,D}.yaml`), 43 tests in `tests/test_prime_rationals.py`. Spec: `agent-context/integer-exp (1).tex`. Experiments pending.
+
+#### ~~Integer-Arithmetic Training for Prime-Exponent MDL~~ — Done (2026-03-30)
+
+Standalone `prime_rationals_int.py` implementing Ghaffari et al. (2022, NeurIPS, arXiv:2207.08822) integer-arithmetic training. Simulated integer GEMM with stochastic rounding and STE for JAX autodiff (float32 dtype, integer-grid values). `IntegerPrimeExpLSTM` Flax module with PRNG-threaded `jax.lax.scan`, SGD+momentum training, 3-mode evaluation (integer/float/discretized). 5 configs for bit-width ablation (`config/prime_rationals_int/anbn_int{4,5,6,8}.yaml` + `anbn_float_sgd.yaml`). 13 tests in `tests/test_integer_training.py`. Spec: `agent-context/integer_training_plan.tex`. Experiments pending.
 
 #### DiffQ-style continuous relaxation for cMNIST — P2 (L — 1+ day)
 
