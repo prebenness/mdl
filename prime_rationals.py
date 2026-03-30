@@ -1,11 +1,14 @@
 """Continuous prime-exponent relaxation for MDL-style rational regularization.
 
 Each neural network weight is parameterized as:
-    s_i = tanh(u_i) * exp(clamp(z_i^T log(primes)))
+    s_i = sign(u_i) * exp(clamp(z_i^T log(primes)))
 
 where z_i in R^P are exponent coordinates and u_i in R is a sign parameter.
-The MDL regularizer is a weighted L1 penalty on exponents:
-    R_mdl = sum_i sum_r |z_{i,r}| * log(p_r)
+sign(u) is discretized via straight-through estimator during training, so u
+encodes only the sign (+/-1), not magnitude. All magnitude must come through z.
+
+The MDL regularizer is:
+    R_mdl = N * 1 bit (signs) + sum_i sum_r |z_{i,r}| * log(p_r)
 
 This is fully differentiable and requires no Gumbel sampling.
 
@@ -100,6 +103,17 @@ def round_ste(z):
     return z + jax.lax.stop_gradient(jnp.round(z) - z)
 
 
+def sign_ste(u):
+    """Straight-through estimator for sign discretization.
+
+    Forward pass returns sign(u) in {-1, +1}; backward pass treats this as
+    identity so gradients flow through to u. Zeros map to +1.
+    """
+    s = jnp.sign(u)
+    s = jnp.where(s == 0, jnp.ones_like(s), s)
+    return u + jax.lax.stop_gradient(s - u)
+
+
 def integer_attraction_penalty(z):
     """Smooth penalty that is zero at integers, maximal at half-integers.
 
@@ -121,7 +135,7 @@ def reconstruct_weight(z, u, log_primes, clamp_val=10.0, mode="continuous"):
 
     Args:
         z: (..., P) exponent coordinates.
-        u: (...) sign parameters.
+        u: (...) sign parameters (only sign is used, via STE).
         log_primes: (P,) log of prime basis.
         clamp_val: clamp range for log-magnitude.
         mode: "continuous" (default, current behavior),
@@ -129,7 +143,7 @@ def reconstruct_weight(z, u, log_primes, clamp_val=10.0, mode="continuous"):
               "frozen_rounded" (hard rounding, no gradient through z).
 
     Returns:
-        weight: (...) reconstructed weights.
+        weight: (...) reconstructed weights s = sign(u) * exp(z^T log(p)).
     """
     if mode == "rounded":
         z_eff = round_ste(z)
@@ -139,21 +153,24 @@ def reconstruct_weight(z, u, log_primes, clamp_val=10.0, mode="continuous"):
         z_eff = z
     logmag = jnp.sum(z_eff * log_primes, axis=-1)
     logmag = jnp.clip(logmag, -clamp_val, clamp_val)
-    sign = jnp.tanh(u)
+    sign = sign_ste(u)
     return sign * jnp.exp(logmag)
 
 
 def compute_mdl_penalty(z, log_primes):
-    """Compute MDL penalty: sum of |z_{i,r}| * log(p_r).
+    """Compute MDL penalty: N_weights * 1 bit (signs) + sum |z_{i,r}| * log(p_r).
 
     Args:
-        z: (..., P) exponent coordinates.
+        z: (..., P) exponent coordinates.  Shape is (N_weights, P).
         log_primes: (P,) log of prime basis.
 
     Returns:
-        Scalar penalty.
+        Scalar penalty in bits.
     """
-    return jnp.sum(jnp.abs(z) * log_primes)
+    n_weights = z.shape[0] if z.ndim >= 1 else 1
+    sign_bits = n_weights * 1.0  # 1 bit per weight for sign
+    exponent_bits = jnp.sum(jnp.abs(z) * log_primes)
+    return sign_bits + exponent_bits
 
 
 # ===========================================================================
@@ -363,7 +380,7 @@ def _normal_init(std):
 class PrimeExpLinear(nn.Module):
     """Dense layer with prime-exponent weight parameterization.
 
-    Each weight is s = tanh(u) * exp(clamp(z^T log(primes))).
+    Each weight is s = sign(u) * exp(clamp(z^T log(primes))).
     """
     features: int
     P: int = 6
@@ -821,42 +838,37 @@ def evaluate_anbn_accuracy(model, params, test_inputs, test_targets,
     Same logic as training.evaluate_deterministic_accuracy but without
     tau/rng arguments (prime-exp forward is deterministic).
 
+    Processes all strings in a single forward pass to avoid repeated
+    JIT compilation and redundant scan steps from per-batch padding.
+
     Returns per-string accuracies and summary statistics.
     """
     N = len(test_inputs)
-    accs = np.zeros(N, dtype=np.float32)
+    max_len = max(len(s) for s in test_inputs)
 
-    for batch_start in range(0, N, batch_size):
-        batch_end = min(batch_start + batch_size, N)
-        batch_inputs = test_inputs[batch_start:batch_end]
-        batch_targets = test_targets[batch_start:batch_end]
-        B = len(batch_inputs)
+    x_pad = np.zeros((N, max_len), dtype=np.int32)
+    y_pad = np.zeros((N, max_len), dtype=np.int32)
+    det_mask = np.zeros((N, max_len), dtype=np.float32)
 
-        max_len = max(len(s) for s in batch_inputs)
-        x_pad = np.zeros((B, max_len), dtype=np.int32)
-        y_pad = np.zeros((B, max_len), dtype=np.int32)
-        det_mask = np.zeros((B, max_len), dtype=np.float32)
+    for i, (inp, tgt) in enumerate(zip(test_inputs, test_targets)):
+        L = len(inp)
+        x_pad[i, :L] = inp
+        y_pad[i, :L] = tgt
+        for t in range(L):
+            if inp[t] == SYMBOL_B:
+                det_mask[i, t] = 1.0
 
-        for i, (inp, tgt) in enumerate(zip(batch_inputs, batch_targets)):
-            L = len(inp)
-            x_pad[i, :L] = inp
-            y_pad[i, :L] = tgt
-            for t in range(L):
-                if inp[t] == SYMBOL_B:
-                    det_mask[i, t] = 1.0
+    x_jnp = jnp.array(x_pad)
+    y_jnp = jnp.array(y_pad)
+    det_mask_jnp = jnp.array(det_mask)
 
-        x_jnp = jnp.array(x_pad)
-        y_jnp = jnp.array(y_pad)
-        det_mask_jnp = jnp.array(det_mask)
+    logits, _ = model.apply({"params": params}, x_jnp)
+    preds = jnp.argmax(logits, axis=-1)
 
-        logits, _ = model.apply({"params": params}, x_jnp)
-        preds = jnp.argmax(logits, axis=-1)
-
-        correct = (preds == y_jnp).astype(jnp.float32)
-        n_det = jnp.sum(det_mask_jnp, axis=-1)
-        n_correct = jnp.sum(correct * det_mask_jnp, axis=-1)
-        batch_accs = jnp.where(n_det > 0, n_correct / n_det, 1.0)
-        accs[batch_start:batch_end] = np.array(batch_accs)
+    correct = (preds == y_jnp).astype(jnp.float32)
+    n_det = jnp.sum(det_mask_jnp, axis=-1)
+    n_correct = jnp.sum(correct * det_mask_jnp, axis=-1)
+    accs = np.array(jnp.where(n_det > 0, n_correct / n_det, 1.0))
 
     perfect = accs >= 1.0 - 1e-6
     n_perfect = int(np.sum(perfect))
@@ -895,8 +907,7 @@ def make_forward_fn(model, params):
 def compute_h_bits(params, P):
     """Compute hypothesis codelength |H| for discretized prime-exp model.
 
-    After rounding exponents to integers, the codelength is the MDL penalty
-    evaluated at the rounded values: sum |e_{i,r}| * log(p_r).
+    |H| = N_weights * 1 bit (signs) + sum |round(z_{i,r})| * log(p_r).
     """
     log_primes = get_log_primes(P)
     disc_params = discretize_params(params, log_primes)

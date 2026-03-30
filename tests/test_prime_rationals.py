@@ -412,14 +412,14 @@ class TestBackwardCompatibility:
         assert cfg.E_max == 6.0
 
     def test_reconstruct_weight_default_unchanged(self):
-        """reconstruct_weight without mode should behave as before."""
+        """reconstruct_weight uses sign_ste(u) for sign, not tanh(u)."""
         P = 3
         log_primes = get_log_primes(P)
         z = jnp.array([[0.3, 0.7, -0.5]])
         u = jnp.array([0.8])
         w = reconstruct_weight(z, u, log_primes)
-        # Manually compute expected
+        # sign(0.8) = +1, so weight = +1 * exp(z^T log(p))
         logmag = jnp.sum(z * log_primes, axis=-1)
         logmag = jnp.clip(logmag, -10.0, 10.0)
-        expected = jnp.tanh(u) * jnp.exp(logmag)
+        expected = 1.0 * jnp.exp(logmag)
         np.testing.assert_allclose(w, expected, atol=1e-6)

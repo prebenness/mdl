@@ -413,44 +413,36 @@ def evaluate_int_anbn_accuracy(model, params, test_inputs, test_targets,
     """Evaluate integer-mode accuracy on a^n b^n test set.
 
     Uses a fixed rng for deterministic integer evaluation.
+    Processes all strings in a single forward pass to avoid repeated
+    JIT compilation and redundant scan steps from per-batch padding.
     """
+    from src.mdl.data import SYMBOL_B
     N = len(test_inputs)
-    accs = np.zeros(N, dtype=np.float32)
+    max_len = max(len(s) for s in test_inputs)
 
-    for batch_start in range(0, N, batch_size):
-        batch_end = min(batch_start + batch_size, N)
-        batch_inputs = test_inputs[batch_start:batch_end]
-        batch_targets = test_targets[batch_start:batch_end]
-        B = len(batch_inputs)
+    x_pad = np.zeros((N, max_len), dtype=np.int32)
+    y_pad = np.zeros((N, max_len), dtype=np.int32)
+    det_mask = np.zeros((N, max_len), dtype=np.float32)
 
-        max_len = max(len(s) for s in batch_inputs)
-        x_pad = np.zeros((B, max_len), dtype=np.int32)
-        y_pad = np.zeros((B, max_len), dtype=np.int32)
-        det_mask = np.zeros((B, max_len), dtype=np.float32)
+    for i, (inp, tgt) in enumerate(zip(test_inputs, test_targets)):
+        L = len(inp)
+        x_pad[i, :L] = inp
+        y_pad[i, :L] = tgt
+        for t in range(L):
+            if inp[t] == SYMBOL_B:
+                det_mask[i, t] = 1.0
 
-        for i, (inp, tgt) in enumerate(zip(batch_inputs, batch_targets)):
-            L = len(inp)
-            x_pad[i, :L] = inp
-            y_pad[i, :L] = tgt
-            from src.mdl.data import SYMBOL_B
-            for t in range(L):
-                if inp[t] == SYMBOL_B:
-                    det_mask[i, t] = 1.0
+    x_jnp = jnp.array(x_pad)
+    y_jnp = jnp.array(y_pad)
+    det_mask_jnp = jnp.array(det_mask)
 
-        x_jnp = jnp.array(x_pad)
-        y_jnp = jnp.array(y_pad)
-        det_mask_jnp = jnp.array(det_mask)
+    logits, _ = model.apply({"params": params}, x_jnp, rng=rng)
+    preds = jnp.argmax(logits, axis=-1)
 
-        # Use fold_in for per-batch deterministic rng
-        batch_rng = jax.random.fold_in(rng, batch_start)
-        logits, _ = model.apply({"params": params}, x_jnp, rng=batch_rng)
-        preds = jnp.argmax(logits, axis=-1)
-
-        correct = (preds == y_jnp).astype(jnp.float32)
-        n_det = jnp.sum(det_mask_jnp, axis=-1)
-        n_correct = jnp.sum(correct * det_mask_jnp, axis=-1)
-        batch_accs = jnp.where(n_det > 0, n_correct / n_det, 1.0)
-        accs[batch_start:batch_end] = np.array(batch_accs)
+    correct = (preds == y_jnp).astype(jnp.float32)
+    n_det = jnp.sum(det_mask_jnp, axis=-1)
+    n_correct = jnp.sum(correct * det_mask_jnp, axis=-1)
+    accs = np.array(jnp.where(n_det > 0, n_correct / n_det, 1.0))
 
     perfect = accs >= 1.0 - 1e-6
     n_perfect = int(np.sum(perfect))
@@ -768,8 +760,76 @@ def run_int_anbn_experiment(config):
 # CLI
 # ===========================================================================
 
+def _build_arg_parser(defaults=None):
+    """Build argument parser. YAML defaults seed argparse so CLI overrides them."""
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Integer-arithmetic prime-exponent training (Ghaffari et al. 2022)",
+    )
+    parser.add_argument(
+        "config", nargs="?", default=None,
+        help="Optional YAML config path. CLI flags override YAML values.",
+    )
+
+    # Task
+    parser.add_argument("--task", type=str, default="anbn",
+                        help="Experiment task (default: anbn)")
+    # Prime basis
+    parser.add_argument("--P", type=int, default=6,
+                        help="Number of primes in basis (default: 6)")
+    # Architecture
+    parser.add_argument("--hidden_size", type=int, default=3,
+                        help="LSTM hidden size (3 matches Lan et al.)")
+    # Training
+    parser.add_argument("--lambda_mdl", type=float, default=100.0,
+                        help="MDL regularization weight")
+    parser.add_argument("--lr", type=float, default=0.01,
+                        help="SGD learning rate")
+    parser.add_argument("--epochs", type=int, default=10000,
+                        help="Number of training epochs")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed")
+    parser.add_argument("--init_std", type=float, default=0.01,
+                        help="Std for exponent/sign parameter initialization")
+    parser.add_argument("--clamp_logmag", type=float, default=10.0,
+                        help="Clamp range for log-magnitude before exp()")
+    parser.add_argument("--momentum", type=float, default=0.9,
+                        help="SGD momentum")
+    # Data
+    parser.add_argument("--num_train", type=int, default=1000,
+                        help="Number of training strings")
+    parser.add_argument("--p", type=float, default=0.3,
+                        help="PCFG termination probability")
+    parser.add_argument("--data_seed", type=int, default=0,
+                        help="Seed for data generation")
+    # Evaluation
+    parser.add_argument("--test_max_n", type=int, default=1500,
+                        help="Max n for test set")
+    parser.add_argument("--eval_every", type=int, default=200,
+                        help="Evaluate every N epochs")
+    parser.add_argument("--log_every", type=int, default=200,
+                        help="Log training metrics every N epochs")
+    # Integer training
+    parser.add_argument("--int_bits", type=int, default=8,
+                        help="Bit width for integer GEMM")
+    parser.add_argument("--use_integer",
+                        type=lambda v: v if isinstance(v, bool) else v.lower() in ('true', '1', 'yes'),
+                        default=True,
+                        help="Use integer arithmetic (False = float SGD baseline)")
+
+    if defaults:
+        valid_dests = {a.dest for a in parser._actions}
+        unknown = sorted(k for k in defaults if k not in valid_dests)
+        if unknown:
+            print(f"Warning: ignoring unknown config keys: {', '.join(unknown)}")
+            defaults = {k: v for k, v in defaults.items() if k in valid_dests}
+        parser.set_defaults(**defaults)
+    return parser
+
+
 def main():
-    """CLI entry point: python prime_rationals_int.py <config.yaml>"""
+    """CLI entry point: python prime_rationals_int.py [config.yaml] [--flag ...]"""
+    # Parse config path first so YAML defaults can seed argparse.
     pre_config_arg = None
     if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
         pre_config_arg = sys.argv[1]
@@ -781,13 +841,14 @@ def main():
             with open(config_path) as f:
                 yaml_defaults = yaml.safe_load(f) or {}
 
-    # Build config from YAML (no argparse complexity needed here)
-    config = IntegerTrainingConfig()
-    for key, val in yaml_defaults.items():
-        if hasattr(config, key):
-            setattr(config, key, val)
-        else:
-            print(f"Warning: ignoring unknown config key: {key}")
+    parser = _build_arg_parser(defaults=yaml_defaults)
+    args = parser.parse_args()
+
+    config = IntegerTrainingConfig(**{
+        f.name: getattr(args, f.name)
+        for f in fields(IntegerTrainingConfig)
+        if hasattr(args, f.name)
+    })
 
     print(f"Config: {config}")
     print(f"Primes ({config.P}): {first_primes(config.P)}")
