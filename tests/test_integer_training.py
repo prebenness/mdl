@@ -17,11 +17,16 @@ from prime_rationals_int import (
     stochastic_round,
     float_to_int,
     int_to_float,
-    int_matmul,
+    _int_matmul_impl,
+    make_int_matmul,
+    make_int_elemwise_mul,
+    make_int_elemwise_add,
     IntegerPrimeExpLSTM,
     IntegerTrainingConfig,
+    IntTrainState,
     create_int_anbn_train_state,
     make_int_anbn_train_step,
+    int_sgd_update,
     cross_entropy_bits,
 )
 from prime_rationals import (
@@ -119,6 +124,7 @@ class TestIntegerGEMM:
     def test_3x3_matmul(self):
         """3x3 integer GEMM matches float within quantization tolerance."""
         rng = jrandom.PRNGKey(42)
+        int_matmul = make_int_matmul(8)
         A = jnp.array([[1.0, 2.0, 3.0],
                         [4.0, 5.0, 6.0],
                         [7.0, 8.0, 9.0]])
@@ -127,7 +133,7 @@ class TestIntegerGEMM:
                         [0.7, 0.8, 0.9]])
 
         C_float = A @ B
-        C_int = int_matmul(A, B, 8, rng)
+        C_int = int_matmul(A, B, rng)
 
         # Relative tolerance: int8 has ~1% precision for these magnitudes
         rel_error = jnp.abs(C_int - C_float) / (jnp.abs(C_float) + 1e-10)
@@ -139,11 +145,12 @@ class TestIntegerGEMM:
     def test_identity_matmul(self):
         """Multiplying by near-identity should roughly preserve values."""
         rng = jrandom.PRNGKey(0)
+        int_matmul = make_int_matmul(8)
         A = jnp.array([[1.0, 0.0, 0.0],
                         [0.0, 1.0, 0.0],
                         [0.0, 0.0, 1.0]])
         B = jnp.array([[2.0], [3.0], [4.0]])
-        C_int = int_matmul(A, B, 8, rng)
+        C_int = int_matmul(A, B, rng)
         C_float = A @ B
         assert jnp.allclose(C_int, C_float, atol=1.0), (
             f"Identity matmul error: {C_int} vs {C_float}"
@@ -298,7 +305,6 @@ class TestSmokeTraining:
 
         state = create_int_anbn_train_state(
             model, init_rng, x_train.shape[1], x_train.shape[0],
-            lr=0.01, momentum=0.9,
         )
 
         # Use lambda_mdl=1.0 (not 100) so the data-fitting NLL gradient
@@ -306,6 +312,8 @@ class TestSmokeTraining:
         train_step = make_int_anbn_train_step(
             lambda_mdl=1.0, n_train=n_train, P=6,
             use_integer=True, int_bits=8,
+            sgd_bits=16, lr=0.01, beta=0.9,
+            model_apply_fn=model.apply,
         )
 
         losses = []
@@ -346,12 +354,13 @@ class TestSmokeTraining:
 
         state = create_int_anbn_train_state(
             model, init_rng, x_train.shape[1], x_train.shape[0],
-            lr=0.01, momentum=0.9,
         )
 
         train_step = make_int_anbn_train_step(
             lambda_mdl=100.0, n_train=n_train, P=6,
             use_integer=False, int_bits=8,
+            sgd_bits=16, lr=0.01, beta=0.9,
+            model_apply_fn=model.apply,
         )
 
         for epoch in range(1, 11):
@@ -360,3 +369,145 @@ class TestSmokeTraining:
                 state, x_train, y_train, mask_train, epoch_rng,
             )
             assert np.isfinite(float(loss)), f"NaN/Inf at epoch {epoch}"
+
+
+class TestIntegerBackward:
+    """Test that custom_vjp gives integer-grid backward GEMMs."""
+
+    def test_int_matmul_backward_finite(self):
+        """Backward through int_matmul via custom_vjp gives finite grads."""
+        int_matmul = make_int_matmul(8)
+        rng = jrandom.PRNGKey(42)
+
+        A = jnp.ones((2, 3)) * 0.5
+        B = jnp.ones((3, 4)) * 0.3
+
+        def f(A, B):
+            return jnp.sum(int_matmul(A, B, rng))
+
+        gA, gB = jax.grad(f, argnums=(0, 1))(A, B)
+        assert jnp.all(jnp.isfinite(gA)), f"dA has NaN/Inf: {gA}"
+        assert jnp.all(jnp.isfinite(gB)), f"dB has NaN/Inf: {gB}"
+        assert gA.shape == A.shape
+        assert gB.shape == B.shape
+
+    def test_int_matmul_backward_unbiased(self):
+        """Averaging over many RNG keys, int backward ~ float backward."""
+        A = jnp.array([[1.0, 2.0], [3.0, 4.0]])
+        B = jnp.array([[0.5, 0.1], [0.2, 0.3]])
+
+        # Float reference gradients
+        def f_float(A, B):
+            return jnp.sum(A @ B)
+        gA_ref, gB_ref = jax.grad(f_float, argnums=(0, 1))(A, B)
+
+        # Average integer gradients over many seeds
+        gA_sum = jnp.zeros_like(A)
+        gB_sum = jnp.zeros_like(B)
+        N = 200
+        for i in range(N):
+            rng = jrandom.PRNGKey(i)
+            int_matmul = make_int_matmul(8)
+            def f_int(A, B):
+                return jnp.sum(int_matmul(A, B, rng))
+            gA_i, gB_i = jax.grad(f_int, argnums=(0, 1))(A, B)
+            gA_sum += gA_i
+            gB_sum += gB_i
+
+        gA_avg = gA_sum / N
+        gB_avg = gB_sum / N
+
+        # Should be close to float reference (unbiased)
+        assert jnp.allclose(gA_avg, gA_ref, atol=0.15), (
+            f"dA not unbiased: avg={gA_avg}, ref={gA_ref}"
+        )
+        assert jnp.allclose(gB_avg, gB_ref, atol=0.15), (
+            f"dB not unbiased: avg={gB_avg}, ref={gB_ref}"
+        )
+
+
+class TestIntegerElemwiseOps:
+    """Test integer element-wise multiply and add with custom_vjp."""
+
+    def test_int_mul_forward(self):
+        """Integer element-wise multiply forward is close to float."""
+        int_mul = make_int_elemwise_mul(8)
+        rng = jrandom.PRNGKey(0)
+        a = jnp.array([1.0, 2.0, -0.5, 3.0])
+        b = jnp.array([0.5, -1.0, 2.0, 0.1])
+        c_int = int_mul(a, b, rng)
+        c_float = a * b
+        assert jnp.allclose(c_int, c_float, atol=0.5), (
+            f"int_mul error: {c_int} vs {c_float}"
+        )
+
+    def test_int_mul_backward_finite(self):
+        """Backward through int_elemwise_mul gives finite grads."""
+        int_mul = make_int_elemwise_mul(8)
+        rng = jrandom.PRNGKey(0)
+        a = jnp.array([1.0, 2.0, -0.5])
+        b = jnp.array([0.5, -1.0, 2.0])
+
+        def f(a, b):
+            return jnp.sum(int_mul(a, b, rng))
+
+        ga, gb = jax.grad(f, argnums=(0, 1))(a, b)
+        assert jnp.all(jnp.isfinite(ga))
+        assert jnp.all(jnp.isfinite(gb))
+
+    def test_int_add_forward(self):
+        """Integer element-wise add forward is close to float."""
+        int_add = make_int_elemwise_add(8)
+        rng = jrandom.PRNGKey(0)
+        a = jnp.array([1.0, -2.0, 0.5])
+        b = jnp.array([0.5, 3.0, -1.0])
+        c_int = int_add(a, b, rng)
+        c_float = a + b
+        assert jnp.allclose(c_int, c_float, atol=0.5), (
+            f"int_add error: {c_int} vs {c_float}"
+        )
+
+    def test_int_add_backward_finite(self):
+        """Backward through int_elemwise_add gives finite grads."""
+        int_add = make_int_elemwise_add(8)
+        rng = jrandom.PRNGKey(0)
+        a = jnp.array([1.0, 2.0])
+        b = jnp.array([0.5, -1.0])
+
+        def f(a, b):
+            return jnp.sum(int_add(a, b, rng))
+
+        ga, gb = jax.grad(f, argnums=(0, 1))(a, b)
+        assert jnp.all(jnp.isfinite(ga))
+        assert jnp.all(jnp.isfinite(gb))
+
+
+class TestIntegerSGD:
+    """Test integer SGD weight update."""
+
+    def test_int_sgd_step(self):
+        """Integer SGD produces finite updated params and momentum."""
+        rng = jrandom.PRNGKey(42)
+        params = {"z_exponents": jnp.ones((10, 6)) * 0.1,
+                  "u_signs": jnp.ones((10,)) * 0.5}
+        grads = {"z_exponents": jnp.ones((10, 6)) * 0.01,
+                 "u_signs": jnp.ones((10,)) * 0.01}
+        momentum = {"z_exponents": jnp.zeros((10, 6)),
+                    "u_signs": jnp.zeros((10,))}
+
+        new_params, new_momentum = int_sgd_update(
+            params, grads, momentum,
+            lr=0.01, beta=0.9, sgd_bits=16, rng=rng,
+        )
+
+        for key in params:
+            assert jnp.all(jnp.isfinite(new_params[key])), (
+                f"NaN/Inf in new_params[{key}]"
+            )
+            assert jnp.all(jnp.isfinite(new_momentum[key])), (
+                f"NaN/Inf in new_momentum[{key}]"
+            )
+            # Params should have changed
+            assert not jnp.allclose(new_params[key], params[key]), (
+                f"Params[{key}] unchanged after SGD step"
+            )
