@@ -2,9 +2,10 @@
 Ghaffari et al. (NeurIPS 2022), "Is Integer Arithmetic Enough for Deep
 Learning Training?", arXiv:2207.08822.
 
-Simulates Ghaffari's dynamic fixed-point representation mapping in JAX
-using float32 dtype but integer-grid values, enabling straight-through
-gradient flow through stochastic rounding.
+Implements Ghaffari's fully-integer training pipeline in JAX: forward pass,
+backward pass (via jax.custom_vjp), and SGD all use integer-grid arithmetic.
+Float32 dtype carries integer-grid values for JAX compatibility; stochastic
+rounding provides unbiased estimation at each quantization point.
 
 The heavy linear algebra (LSTM gate matmuls, output projection) is
 performed on the integer grid; pointwise nonlinearities (sigmoid, tanh,
@@ -20,15 +21,14 @@ import sys
 import time
 from dataclasses import dataclass, field, fields
 from pathlib import Path
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 from jax import random as jrandom
 import flax.linen as nn
 import numpy as np
-import optax
 import yaml
-from flax.training import train_state
 
 # Reuse existing codebase utilities
 from prime_rationals import (
@@ -146,42 +146,198 @@ def int_to_float(A_int, e_max, bits):
 # Module 2: Integer GEMM
 # ===========================================================================
 
-def int_matmul(A_float, B_float, bits, rng):
-    """Simulated integer matrix multiplication.
+def _int_matmul_impl(A_float, B_float, bits, rng):
+    """Core integer matmul: quantize inputs, integer GEMM, dequantize.
 
-    Both inputs are quantized to the integer grid, multiplied in float
-    (but with integer-grid values), and the result is re-quantized.
-    This is the "critical insight" from the spec: float dtype for autodiff
-    but integer-grid values for correctness.
-
-    Reference: Ghaffari et al. (NeurIPS 2022), Section 3.3, Figure 2.
-
-    Args:
-        A_float: (..., M, K) float tensor.
-        B_float: (..., K, N) float tensor.
-        bits: integer bit-width B.
-        rng: JAX PRNG key.
-
-    Returns:
-        C_float: (..., M, N) float result, re-quantized to integer grid.
+    Returns (C_float, A_int, e_A, B_int, e_B) — the extra outputs are
+    needed by the custom_vjp backward to reuse forward quantizations.
     """
-    rng1, rng2, rng3 = jax.random.split(rng, 3)
-
-    # Quantize inputs to integer grid
+    rng1, rng2 = jax.random.split(rng)
     A_int, e_A = float_to_int(A_float, bits, rng1)
     B_int, e_B = float_to_int(B_float, bits, rng2)
-
-    # Integer matmul (float dtype, integer values)
     C_int = A_int @ B_int
-
-    # Combined exponent
     e_C = e_A + e_B
-
-    # Convert accumulator back to float scale, then re-quantize
     C_float = int_to_float(C_int, e_C, 2 * bits - 1)
-    # Re-quantize the wide result back to B-bit
-    C_requant, e_C_new = float_to_int(C_float, bits, rng3)
-    return int_to_float(C_requant, e_C_new, bits)
+    return C_float, A_int, e_A, B_int, e_B
+
+
+def _rng_to_float(rng):
+    """Bitcast uint32 RNG key to float32, preserving all bits exactly."""
+    return jax.lax.bitcast_convert_type(rng, jnp.float32)
+
+
+def _float_to_rng(rng_f):
+    """Bitcast float32 back to uint32 RNG key."""
+    return jax.lax.bitcast_convert_type(rng_f, jnp.uint32)
+
+
+def make_int_matmul(bits):
+    """Factory for integer matmul with custom_vjp for integer backward.
+
+    The backward GEMMs (dA = dC @ B^T, dB = A^T @ dC) are also performed
+    in integer arithmetic, matching Ghaffari et al. Section 3.3 and
+    Appendix B: both forward and backward use the integer GEMM pipeline.
+
+    RNG keys are bitcast to float32 so they can be passed as regular
+    differentiable arguments to custom_vjp (avoids nondiff_argnums issues
+    with JAX tracers inside jax.lax.scan). Zero tangent returned for rng.
+
+    Reference: Ghaffari et al. (NeurIPS 2022), Section 3.3, Appendix B.
+    """
+
+    @jax.custom_vjp
+    def _core(A, B, rng_f):
+        rng = _float_to_rng(rng_f)
+        C_float, _, _, _, _ = _int_matmul_impl(A, B, bits, rng)
+        return C_float
+
+    def _core_fwd(A, B, rng_f):
+        rng = _float_to_rng(rng_f)
+        rng_fwd, rng_bwd = jax.random.split(rng)
+        C_float, A_int, e_A, B_int, e_B = _int_matmul_impl(
+            A, B, bits, rng_fwd,
+        )
+        return C_float, (A_int, e_A, B_int, e_B, _rng_to_float(rng_bwd))
+
+    def _core_bwd(res, g):
+        A_int, e_A, B_int, e_B, rng_bwd_f = res
+        rng_bwd = _float_to_rng(rng_bwd_f)
+        rng1, rng2 = jax.random.split(rng_bwd)
+
+        g_int, e_g = float_to_int(g, bits, rng1)
+
+        B_int_T = jnp.swapaxes(B_int, -2, -1)
+        dA_int = g_int @ B_int_T
+        e_dA = e_g + e_B
+        dA = int_to_float(dA_int, e_dA, 2 * bits - 1)
+
+        g_int2, e_g2 = float_to_int(g, bits, rng2)
+        A_int_T = jnp.swapaxes(A_int, -2, -1)
+        dB_int = A_int_T @ g_int2
+        e_dB = e_A + e_g2
+        dB_full = int_to_float(dB_int, e_dB, 2 * bits - 1)
+
+        # Sum over batch dims to match B's shape (A may be batched, B not)
+        n_extra = dB_full.ndim - B_int.ndim
+        if n_extra > 0:
+            dB = dB_full.sum(axis=tuple(range(n_extra)))
+        else:
+            dB = dB_full
+
+        return (dA, dB, jnp.zeros_like(rng_bwd_f))
+
+    _core.defvjp(_core_fwd, _core_bwd)
+
+    def int_matmul(A, B, rng):
+        return _core(A, B, _rng_to_float(rng))
+
+    return int_matmul
+
+
+def make_int_elemwise_mul(bits):
+    """Factory for integer element-wise multiply with integer backward.
+
+    Forward: quantize a, b → a_int * b_int (element-wise) → dequantize.
+    Backward: da = g * b, db = g * a, both in integer arithmetic.
+
+    The product of two B-bit integers fits in (2B-1) bits, so dequantize
+    uses the wider bit-width for the combined exponent.
+
+    Reference: Ghaffari et al. (NeurIPS 2022), Section 3.4.
+    """
+
+    @jax.custom_vjp
+    def _core(a, b, rng_f):
+        rng = _float_to_rng(rng_f)
+        rng1, rng2 = jax.random.split(rng)
+        a_int, e_a = float_to_int(a, bits, rng1)
+        b_int, e_b = float_to_int(b, bits, rng2)
+        c_int = a_int * b_int
+        e_c = e_a + e_b
+        return int_to_float(c_int, e_c, 2 * bits - 1)
+
+    def _core_fwd(a, b, rng_f):
+        rng = _float_to_rng(rng_f)
+        rng_fwd, rng_bwd = jax.random.split(rng)
+        rng1, rng2 = jax.random.split(rng_fwd)
+        a_int, e_a = float_to_int(a, bits, rng1)
+        b_int, e_b = float_to_int(b, bits, rng2)
+        c_int = a_int * b_int
+        e_c = e_a + e_b
+        c_float = int_to_float(c_int, e_c, 2 * bits - 1)
+        return c_float, (a_int, e_a, b_int, e_b, _rng_to_float(rng_bwd))
+
+    def _core_bwd(res, g):
+        a_int, e_a, b_int, e_b, rng_bwd_f = res
+        rng_bwd = _float_to_rng(rng_bwd_f)
+        rng1, rng2 = jax.random.split(rng_bwd)
+
+        g_int1, e_g1 = float_to_int(g, bits, rng1)
+        da_int = g_int1 * b_int
+        e_da = e_g1 + e_b
+        da = int_to_float(da_int, e_da, 2 * bits - 1)
+
+        g_int2, e_g2 = float_to_int(g, bits, rng2)
+        db_int = g_int2 * a_int
+        e_db = e_g2 + e_a
+        db = int_to_float(db_int, e_db, 2 * bits - 1)
+
+        return (da, db, jnp.zeros_like(rng_bwd_f))
+
+    _core.defvjp(_core_fwd, _core_bwd)
+
+    def int_mul(a, b, rng):
+        return _core(a, b, _rng_to_float(rng))
+
+    return int_mul
+
+
+def make_int_elemwise_add(bits):
+    """Factory for integer element-wise add with integer backward.
+
+    Forward: quantize a and b to a shared exponent (via concatenation so
+    float_to_int produces one e_max), then integer add, dequantize.
+    Backward: gradient passes through to both inputs, re-quantized to
+    the integer grid (paper: all gradients are in fixed-point).
+
+    Reference: Ghaffari et al. (NeurIPS 2022), Section 3.4.
+    """
+
+    @jax.custom_vjp
+    def _core(a, b, rng_f):
+        rng = _float_to_rng(rng_f)
+        ab = jnp.concatenate([a, b], axis=-1)
+        ab_int, e_ab = float_to_int(ab, bits, rng)
+        n = a.shape[-1]
+        c_int = ab_int[..., :n] + ab_int[..., n:]
+        return int_to_float(c_int, e_ab, bits)
+
+    def _core_fwd(a, b, rng_f):
+        rng = _float_to_rng(rng_f)
+        rng_fwd, rng_bwd = jax.random.split(rng)
+        ab = jnp.concatenate([a, b], axis=-1)
+        ab_int, e_ab = float_to_int(ab, bits, rng_fwd)
+        n = a.shape[-1]
+        c_int = ab_int[..., :n] + ab_int[..., n:]
+        c_float = int_to_float(c_int, e_ab, bits)
+        return c_float, (_rng_to_float(rng_bwd),)
+
+    def _core_bwd(res, g):
+        rng_bwd_f, = res
+        rng_bwd = _float_to_rng(rng_bwd_f)
+        rng1, rng2 = jax.random.split(rng_bwd)
+        g_int1, e_g1 = float_to_int(g, bits, rng1)
+        da = int_to_float(g_int1, e_g1, bits)
+        g_int2, e_g2 = float_to_int(g, bits, rng2)
+        db = int_to_float(g_int2, e_g2, bits)
+        return (da, db, jnp.zeros_like(rng_bwd_f))
+
+    _core.defvjp(_core_fwd, _core_bwd)
+
+    def int_add(a, b, rng):
+        return _core(a, b, _rng_to_float(rng))
+
+    return int_add
 
 
 # ===========================================================================
@@ -277,25 +433,28 @@ class IntegerPrimeExpLSTM(nn.Module):
         # --- One-hot encode input ---
         x_onehot = jax.nn.one_hot(x, I)  # (B, T, I)
 
-        # --- Choose matmul function ---
+        # --- Build integer ops (factories close over bit-width) ---
         use_int = self.use_integer
+        if use_int:
+            _int_matmul = make_int_matmul(bits)
+            _int_mul = make_int_elemwise_mul(bits)
+            _int_add = make_int_elemwise_add(bits)
 
         def _matmul(A, B, sub_rng):
             """Gate matmul: integer or float."""
             if use_int:
-                return int_matmul(A, B, bits, sub_rng)
+                return _int_matmul(A, B, sub_rng)
             else:
                 return A @ B
 
         # --- LSTM scan ---
-        # Pre-split rng: T step keys, each split into 9 sub-keys
-        # (8 gate matmuls + 1 output matmul, though output is outside scan)
+        # Pre-split rng: T step keys + 1 output key
+        # Per timestep: 8 gate matmuls + 4 element-wise ops = 12 sub-keys
         if use_int and rng is not None:
             step_keys = jax.random.split(rng, T + 1)
-            scan_keys = step_keys[:T]  # (T, 2) -- keys for each timestep
+            scan_keys = step_keys[:T]
             output_key = step_keys[T]
         else:
-            # Dummy keys that won't be used
             scan_keys = jnp.zeros((T, 2), dtype=jnp.uint32)
             output_key = jrandom.PRNGKey(0)
 
@@ -304,10 +463,10 @@ class IntegerPrimeExpLSTM(nn.Module):
             x_t, step_key = inputs
 
             if use_int:
-                # Split step key into 8 sub-keys for 8 gate matmuls
-                sub_keys = jax.random.split(step_key, 8)
+                # 12 sub-keys: 8 gate matmuls + 4 element-wise ops
+                sub_keys = jax.random.split(step_key, 12)
             else:
-                sub_keys = jnp.zeros((8, 2), dtype=jnp.uint32)
+                sub_keys = jnp.zeros((12, 2), dtype=jnp.uint32)
 
             # Gate computations: x_t @ W_q + b_qi + h @ W_qh + b_qh
             pre_i = (_matmul(x_t, W_ii, sub_keys[0]) + b_ii
@@ -319,15 +478,22 @@ class IntegerPrimeExpLSTM(nn.Module):
             pre_o = (_matmul(x_t, W_io, sub_keys[6]) + b_io
                      + _matmul(h, W_ho, sub_keys[7]) + b_ho)
 
-            # Nonlinearities stay in float
+            # Nonlinearities stay in float (Ghaffari Section 5)
             i_t = jax.nn.sigmoid(pre_i)
             f_t = jax.nn.sigmoid(pre_f)
             g_t = jnp.tanh(pre_g)
             o_t = jax.nn.sigmoid(pre_o)
 
-            # Cell and hidden state update (float)
-            c = f_t * c + i_t * g_t
-            h = o_t * jnp.tanh(c)
+            # Cell and hidden state update — integer element-wise ops
+            if use_int:
+                fc = _int_mul(f_t, c, sub_keys[8])
+                ig = _int_mul(i_t, g_t, sub_keys[9])
+                c = _int_add(fc, ig, sub_keys[10])
+                h = _int_mul(o_t, jnp.tanh(c), sub_keys[11])
+            else:
+                c = f_t * c + i_t * g_t
+                h = o_t * jnp.tanh(c)
+
             return (h, c), h
 
         h0 = jnp.zeros((B_batch, H))
@@ -357,34 +523,106 @@ class IntegerPrimeExpLSTM(nn.Module):
 
 
 # ===========================================================================
-# Module 4: Training Loop
+# Module 4: Integer SGD & Training Loop
 # ===========================================================================
 
-def create_int_anbn_train_state(model, rng, seq_len, batch_size, lr, momentum):
-    """Initialize train state with SGD + momentum (not Adam)."""
+class IntTrainState(NamedTuple):
+    """Minimal JIT-compatible train state for integer SGD.
+
+    Unlike flax.training.TrainState, this does NOT use optax —
+    the weight update is performed manually in integer arithmetic.
+    """
+    step: jnp.ndarray   # scalar int32
+    params: dict
+    momentum: dict
+
+
+def _int_sgd_leaf(w, g, m, lr, beta, sgd_bits, rng):
+    """Integer SGD update for a single parameter leaf.
+
+    m_new = beta * m + g            (integer add at sgd_bits)
+    w_new = w - lr * m_new          (integer subtract at sgd_bits)
+
+    Uses concatenation trick to align exponents before integer add/sub.
+
+    Reference: Ghaffari et al. (NeurIPS 2022), Appendix D, Eq. 18.
+    """
+    r1, r2 = jax.random.split(rng)
+
+    # --- Momentum update: m_new = beta*m + g ---
+    bm = beta * m  # scalar * array, float
+    bm_g = jnp.concatenate([bm.ravel(), g.ravel()])
+    bm_g_int, e_bm_g = float_to_int(bm_g, sgd_bits, r1)
+    n = bm.size
+    m_new_int = bm_g_int[:n] + bm_g_int[n:]
+    m_new = int_to_float(m_new_int, e_bm_g, sgd_bits).reshape(m.shape)
+
+    # --- Weight update: w_new = w - lr * m_new ---
+    update = lr * m_new  # scalar * array, float
+    w_upd = jnp.concatenate([w.ravel(), update.ravel()])
+    w_upd_int, e_wu = float_to_int(w_upd, sgd_bits, r2)
+    nw = w.size
+    w_new_int = w_upd_int[:nw] - w_upd_int[nw:]
+    w_new = int_to_float(w_new_int, e_wu, sgd_bits).reshape(w.shape)
+
+    return w_new, m_new
+
+
+def int_sgd_update(params, grads, momentum, lr, beta, sgd_bits, rng):
+    """Integer SGD with momentum over a full param pytree.
+
+    All arithmetic (momentum accumulation, weight update) is performed
+    on the integer grid at sgd_bits (paper uses int16, Section 5).
+
+    Reference: Ghaffari et al. (NeurIPS 2022), Appendix D.
+    """
+    flat_w, treedef = jax.tree.flatten(params)
+    flat_g, _ = jax.tree.flatten(grads)
+    flat_m, _ = jax.tree.flatten(momentum)
+    leaf_rngs = jax.random.split(rng, len(flat_w))
+
+    new_w, new_m = [], []
+    for w, g, m, lrng in zip(flat_w, flat_g, flat_m, leaf_rngs):
+        w_new, m_new = _int_sgd_leaf(w, g, m, lr, beta, sgd_bits, lrng)
+        new_w.append(w_new)
+        new_m.append(m_new)
+
+    return treedef.unflatten(new_w), treedef.unflatten(new_m)
+
+
+def create_int_anbn_train_state(model, rng, seq_len, batch_size):
+    """Initialize train state for integer SGD (no optax)."""
     dummy_x = jnp.zeros((batch_size, seq_len), dtype=jnp.int32)
-    # Need a dummy rng for the model init
     rng_init, rng_model = jax.random.split(rng)
     params = model.init(rng_init, dummy_x, rng=rng_model)["params"]
-    tx = optax.sgd(learning_rate=lr, momentum=momentum)
-    return train_state.TrainState.create(
-        apply_fn=model.apply, params=params, tx=tx,
+    # Zero-initialize momentum buffer matching param shapes
+    momentum = jax.tree.map(jnp.zeros_like, params)
+    return IntTrainState(
+        step=jnp.int32(0),
+        params=params,
+        momentum=momentum,
     )
 
 
-def make_int_anbn_train_step(lambda_mdl, n_train, P, use_integer, int_bits):
-    """Create JIT-compiled integer ANBN training step.
+def make_int_anbn_train_step(lambda_mdl, n_train, P, use_integer, int_bits,
+                             sgd_bits, lr, beta, model_apply_fn):
+    """Create JIT-compiled training step with integer forward, backward, and SGD.
 
-    Each call gets a fresh rng key for stochastic rounding.
-    SGD + momentum optimizer (Ghaffari's proof covers SGD).
+    The custom_vjp on int_matmul/int_elemwise_* ensures gradients are
+    computed in integer arithmetic. Then int_sgd_update applies the weight
+    update in integer arithmetic at sgd_bits (int16 per paper Section 5).
+
+    Reference: Ghaffari et al. (NeurIPS 2022), Sections 3-4, Appendix D.
     """
     log_primes = get_log_primes(P)
 
     @jax.jit
     def train_step(state, x, y, mask, rng):
+        rng_fwd, rng_sgd = jax.random.split(rng)
+
         def loss_fn(params):
-            logits, aux = state.apply_fn(
-                {"params": params}, x, rng=rng,
+            logits, aux = model_apply_fn(
+                {"params": params}, x, rng=rng_fwd,
             )
             data_nll = cross_entropy_bits(logits, y, mask)
             mdl_reg = aux["mdl_penalty"]
@@ -398,8 +636,28 @@ def make_int_anbn_train_step(lambda_mdl, n_train, P, use_integer, int_bits):
         (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
             state.params,
         )
-        state = state.apply_gradients(grads=grads)
-        return state, loss, aux
+
+        # Integer SGD weight update
+        if use_integer:
+            new_params, new_momentum = int_sgd_update(
+                state.params, grads, state.momentum,
+                lr, beta, sgd_bits, rng_sgd,
+            )
+        else:
+            # Float SGD baseline (for comparison)
+            new_momentum = jax.tree.map(
+                lambda m, g: beta * m + g, state.momentum, grads,
+            )
+            new_params = jax.tree.map(
+                lambda w, m: w - lr * m, state.params, new_momentum,
+            )
+
+        new_state = IntTrainState(
+            step=state.step + 1,
+            params=new_params,
+            momentum=new_momentum,
+        )
+        return new_state, loss, aux
 
     return train_step
 
@@ -510,6 +768,7 @@ class IntegerTrainingConfig:
 
     # Integer training fields
     int_bits: int = 8
+    sgd_bits: int = 16  # Ghaffari Section 5: int16 for SGD weight updates
     momentum: float = 0.9
     use_integer: bool = True
 
@@ -579,15 +838,17 @@ def run_int_anbn_experiment(config):
     rng, init_rng = jax.random.split(rng)
     state = create_int_anbn_train_state(
         model, init_rng, x_train.shape[1], x_train.shape[0],
-        config.lr, config.momentum,
     )
     n_model_params = sum(p.size for p in jax.tree.leaves(state.params))
     print(f"Model parameters: {n_model_params} "
           f"(108 weights x P={config.P} exponents + 108 signs)")
+    print(f"sgd_bits={config.sgd_bits}")
 
     train_step = make_int_anbn_train_step(
         config.lambda_mdl, n_train, config.P,
         config.use_integer, config.int_bits,
+        config.sgd_bits, config.lr, config.momentum,
+        model.apply,
     )
 
     # --- Metrics log ---
@@ -812,6 +1073,8 @@ def _build_arg_parser(defaults=None):
     # Integer training
     parser.add_argument("--int_bits", type=int, default=8,
                         help="Bit width for integer GEMM")
+    parser.add_argument("--sgd_bits", type=int, default=16,
+                        help="Bit width for integer SGD (Ghaffari: int16)")
     parser.add_argument("--use_integer",
                         type=lambda v: v if isinstance(v, bool) else v.lower() in ('true', '1', 'yes'),
                         default=True,
