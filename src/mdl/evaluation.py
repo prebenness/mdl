@@ -140,6 +140,47 @@ def compute_per_string_nll_bits(
 # Grammar-weighted test NLL  (|D:H| data term, test)
 # ---------------------------------------------------------------------------
 
+def compute_grammar_weighted_nll_bits_task(
+    forward_fn,
+    task,
+    batch_size: int = 64,
+    verbose: bool = False,
+    **test_set_kwargs,
+) -> dict:
+    """Grammar-weighted |D:H| data term on the task's exhaustive test set.
+
+    Works for any task implementing the TaskSpec interface.
+
+    Args:
+        forward_fn: callable (x_batch) -> logits.
+        task: a TaskSpec instance.
+        batch_size: strings per batch.
+        verbose: if True, print batch progress.
+        **test_set_kwargs: forwarded to task.make_test_set() and
+            task.compute_grammar_weights() (e.g. max_n, max_length).
+
+    Returns:
+        dict with data_dh_bits, nll_per_string, grammar_weights.
+    """
+    if verbose:
+        print(f"  Computing grammar-weighted |D:H|_test for {task.name}...")
+    test_inputs, test_targets = task.make_test_set(**test_set_kwargs)
+    weights = task.compute_grammar_weights(**test_set_kwargs)
+
+    nll_per_string = compute_per_string_nll_bits(
+        forward_fn, test_inputs, test_targets, batch_size=batch_size,
+        verbose=verbose,
+    )
+
+    data_dh = float(np.sum(weights * nll_per_string))
+
+    return {
+        "data_dh_bits": data_dh,
+        "nll_per_string": nll_per_string,
+        "grammar_weights": weights,
+    }
+
+
 def compute_grammar_weighted_nll_bits(
     forward_fn,
     max_n: int,
@@ -147,25 +188,9 @@ def compute_grammar_weighted_nll_bits(
     batch_size: int = 64,
     verbose: bool = False,
 ) -> dict:
-    """Grammar-weighted |D:H| data term on the exhaustive test set.
+    """Grammar-weighted |D:H| for aⁿbⁿ (legacy wrapper).
 
-    |D:H|_test = Σ_{n=1}^{max_n} P(n) × NLL_total(n)
-
-    where NLL_total(n) is the total NLL in bits for string aⁿbⁿ,
-    P(n) = p*(1-p)^n is the raw PCFG probability (unnormalized).
-
-    Test set starts at n=1 following Abudy et al. (2025,
-    arXiv:2505.13398v2, Appendix A.1).
-
-    Args:
-        forward_fn: callable (x_batch) -> logits.
-        max_n: largest n in the test set.
-        p: PCFG termination probability.
-        batch_size: strings per batch.
-        verbose: if True, print batch progress.
-
-    Returns:
-        dict with data_dh_bits, nll_per_string, grammar_weights, max_n.
+    See compute_grammar_weighted_nll_bits_task for the task-agnostic version.
     """
     if verbose:
         print(f"  Computing grammar-weighted |D:H|_test (n=1..{max_n})...")
@@ -345,6 +370,48 @@ def compute_trained_h_bits(params, grid_codelengths, hidden_size: int) -> dict:
     }
 
 
+def evaluate_trained_network_dh_task(
+    apply_fn,
+    params,
+    grid_codelengths,
+    hidden_size: int,
+    task,
+    batch_size: int = 64,
+    **test_set_kwargs,
+) -> dict:
+    """Task-agnostic composite |D:H| evaluation for paper comparison.
+
+    Args:
+        apply_fn: model.apply function.
+        params: params dict with "logits" key.
+        grid_codelengths: per-grid-point codelengths.
+        hidden_size: LSTM hidden size (for architecture encoding).
+        task: a TaskSpec instance.
+        batch_size: strings per batch.
+        **test_set_kwargs: forwarded to task.make_test_set() and
+            task.compute_grammar_weights().
+
+    Returns:
+        dict with data_dh_bits, h_bits, arch_bits, weight_bits.
+    """
+    h_result = compute_trained_h_bits(params, grid_codelengths, hidden_size)
+
+    def discrete_fwd(x):
+        logits, _ = apply_fn(
+            {"params": params}, x, tau=1.0, train=False,
+        )
+        return logits
+
+    data_result = compute_grammar_weighted_nll_bits_task(
+        discrete_fwd, task, batch_size=batch_size, **test_set_kwargs,
+    )
+
+    return {
+        "data_dh_bits": data_result["data_dh_bits"],
+        **h_result,
+    }
+
+
 def evaluate_trained_network_dh(
     apply_fn,
     params,
@@ -354,28 +421,12 @@ def evaluate_trained_network_dh(
     p: float = 0.3,
     batch_size: int = 64,
 ) -> dict:
-    """Composite evaluation of a trained network for paper comparison.
+    """Composite |D:H| for aⁿbⁿ (legacy wrapper).
 
-    Returns test |D:H| (data term), |H|, and the total, using the
-    discretised (argmax) network for both.
-
-    Args:
-        apply_fn: model.apply function.
-        params: params dict (basic mode: has "logits"; shared mode:
-            caller should extract model-only params first).
-        grid_codelengths: float array (M,) of per-grid-point codelengths.
-        hidden_size: LSTM hidden size.
-        test_max_n: largest n in the test set.
-        p: PCFG termination probability.
-        batch_size: strings per batch.
-
-    Returns:
-        dict with data_dh_bits, h_bits, arch_bits, weight_bits.
+    See evaluate_trained_network_dh_task for the task-agnostic version.
     """
-    # |H|
     h_result = compute_trained_h_bits(params, grid_codelengths, hidden_size)
 
-    # |D:H| data term via discrete forward pass
     def discrete_fwd(x):
         logits, _ = apply_fn(
             {"params": params}, x, tau=1.0, train=False,

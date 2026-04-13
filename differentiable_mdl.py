@@ -67,7 +67,13 @@ from src.mdl.data import (
     NUM_SYMBOLS,
     SYMBOL_A,
 )
+from src.mdl.tasks import get_task
+from src.mdl.golden_registry import get_golden, has_golden
 from src.mdl.lstm import GumbelSoftmaxLSTM, decode_weights
+from src.mdl.freeform_rnn import (
+    GumbelSoftmaxFreeFormRNN, decode_freeform_weights, FreeFormTopology,
+)
+from src.mdl.freeform_coding import freeform_codelength
 from src.mdl.training import (
     create_mdl_state,
     make_train_step,
@@ -98,6 +104,7 @@ from src.mdl.analysis import (
 )
 from src.mdl.evaluation import (
     compute_grammar_weighted_nll_bits,
+    compute_grammar_weighted_nll_bits_task,
     compute_optimal_dh_test,
     compute_optimal_dh_train,
     compute_train_dh,
@@ -138,7 +145,8 @@ def make_run_dir(args, suffix=""):
         f"_lr{args.lr}_lam{lam}"
         f"_g{args.n_max}x{args.m_max}_s{args.seed}{cfg_tag}{suffix}"
     )
-    run_dir = make_experiment_dir("anbn_mdl", name)
+    task_dir = f"{args.task}_mdl"
+    run_dir = make_experiment_dir(task_dir, name)
     save_config(run_dir, vars(args))
     return run_dir
 
@@ -225,13 +233,59 @@ def _should_update_best(n_perfect, gen_n, complexity_bits,
     return complexity_bits < best_complexity_bits
 
 
-def get_train_max_n(inputs):
+def get_train_max_n(inputs, task=None):
     """Find the maximum n in the training set."""
     max_n = 0
     for inp in inputs:
-        n = sum(1 for s in inp if s == SYMBOL_A)
+        if task is not None:
+            # _string_n counts content symbols (a's, open-brackets, etc.)
+            n = task._string_n(list(inp))
+        else:
+            n = sum(1 for s in inp if s == SYMBOL_A)
         max_n = max(max_n, n)
     return max_n
+
+
+def get_freeform_topology(task_name):
+    """Return the golden free-form topology for a task.
+
+    These topologies define the search space for differentiable free-form
+    RNN training. They match the golden network architectures from
+    Abudy et al. (2025, arXiv:2505.13398v2).
+    """
+    if task_name == "anbn":
+        from src.mdl.golden_freeform_anbn import TOPOLOGY
+        return TOPOLOGY
+    elif task_name == "dyck1":
+        from src.mdl.golden_freeform_dyck1 import TOPOLOGY
+        return TOPOLOGY
+    elif task_name == "anbncn":
+        from src.mdl.golden_freeform_anbncn import TOPOLOGY
+        return TOPOLOGY
+    else:
+        raise ValueError(f"No default freeform topology for task {task_name!r}")
+
+
+def compute_freeform_discrete_h_bits(eval_params, topology, grid, grid_values):
+    """Compute |H| for a trained free-form RNN using the Lan encoding.
+
+    Decodes discrete weights from logits (argmax), converts to Fraction,
+    and computes freeform_codelength.
+    """
+    logits = eval_params["logits"]
+    idx = jnp.argmax(logits, axis=-1)
+    n_conn = len(topology.connections)
+    n_bias = len(topology.sorted_biased_units())
+
+    weights_rational = []
+    for i in range(n_conn):
+        weights_rational.append(grid[int(idx[i])])
+
+    biases_rational = {}
+    for j, u in enumerate(topology.sorted_biased_units()):
+        biases_rational[u] = grid[int(idx[n_conn + j])]
+
+    return freeform_codelength(topology, weights_rational, biases_rational)
 
 
 def compute_discrete_mdl_score(eval_params, grid, grid_values):
@@ -254,36 +308,23 @@ def compute_discrete_mdl_score(eval_params, grid, grid_values):
     return total_hyp_bits
 
 
-def evaluate_golden_baseline(test_max_n, p):
+def evaluate_golden_baseline(test_max_n, p, task_name="anbn"):
     """Run golden network evaluation and MDL scoring.
 
-    For moderate test_max_n, evaluate exactly with the batched JAX forward.
-    For larger ranges, switch to a sparse finite-precision benchmark instead
-    of assuming the handcrafted network is perfect for all n.
+    For aⁿbⁿ with large test_max_n, uses sparse finite-precision benchmark.
+    For other tasks/ranges, evaluates via the batched JAX forward.
     """
     print("\n" + "=" * 60)
-    print("GOLDEN NETWORK BASELINE (Lan et al. 2024)")
+    print("GOLDEN NETWORK BASELINE")
     print("=" * 60)
 
-    # MDL score of the golden network
-    mdl = golden_mdl_score(p=p)
+    golden_spec = get_golden(task_name)
+    mdl = golden_spec.mdl_score(p=p)
     print(f"  Golden |H| = {mdl['total_bits']} bits "
-          f"({mdl['arch_bits']} arch + {mdl['weight_bits']} weights, "
-          f"{mdl['n_nonzero']} non-zero)")
+          f"({mdl['arch_bits']} arch + {mdl['weight_bits']} weights)")
 
-    if test_max_n <= 1500:
-        # Evaluate normally for standard test range
-        print(f"  Evaluating golden network on n=1..{test_max_n}...")
-        golden_result = evaluate_golden_network(max_n=test_max_n, p=p)
-        golden_acc = golden_result["mean_accuracy"]
-        print(f"  Golden det. accuracy: {golden_acc*100:.1f}%")
-        if golden_result["all_correct"]:
-            print(f"  All correct: YES")
-        else:
-            print(f"  First failure at n={golden_result['first_failure_n']}")
-    else:
-        # For large n, use the exact float32 counter limit rather than the
-        # idealized mathematical claim.
+    # aⁿbⁿ has a dedicated float32 limit estimator for large n
+    if task_name == "anbn" and test_max_n > 1500:
         print(f"  Estimating float32 golden boundary up to n={test_max_n}...")
         golden_result = estimate_golden_float32_limit(max_n=test_max_n, p=p)
         print(f"  Finite-precision golden range: n=1..{golden_result['max_correct_n']}")
@@ -295,6 +336,39 @@ def evaluate_golden_baseline(test_max_n, p):
                 f"n={golden_result['first_failure_n']}"
             )
         print(f"  Probe trace: {len(golden_result['probes'])} sparse checks")
+    elif task_name == "anbn":
+        print(f"  Evaluating golden network on n=1..{test_max_n}...")
+        golden_result = evaluate_golden_network(max_n=test_max_n, p=p)
+        golden_acc = golden_result["mean_accuracy"]
+        print(f"  Golden det. accuracy: {golden_acc*100:.1f}%")
+        if golden_result["all_correct"]:
+            print(f"  All correct: YES")
+        else:
+            print(f"  First failure at n={golden_result['first_failure_n']}")
+    else:
+        # Generic evaluation: test via forward pass on task test set
+        params = golden_spec.build_params(p=p)
+        from src.mdl.tasks import get_task
+        task = get_task(task_name, p=p)
+        test_inputs, test_targets = task.make_test_set(max_n=test_max_n)
+        n_correct = 0
+        first_failure = None
+        for i, (inp, tgt) in enumerate(zip(test_inputs, test_targets)):
+            x = jnp.array([inp], dtype=jnp.int32)
+            logits = golden_spec.forward(params, x)
+            preds = jnp.argmax(logits[0], axis=-1)
+            if jnp.all(preds[:len(tgt)] == jnp.array(tgt)):
+                n_correct += 1
+            elif first_failure is None:
+                first_failure = i + 1
+        all_correct = n_correct == len(test_inputs)
+        print(f"  Golden det. accuracy: {n_correct}/{len(test_inputs)}")
+        golden_result = {
+            "all_correct": all_correct,
+            "first_failure_n": first_failure,
+            "n_correct": n_correct,
+            "mean_accuracy": n_correct / max(1, len(test_inputs)),
+        }
 
     return mdl, golden_result
 
@@ -1147,6 +1221,10 @@ def _build_arg_parser(defaults=None):
         "config", nargs="?", default=None,
         help="Optional YAML config path. CLI flags override YAML values.",
     )
+    # Task
+    parser.add_argument("--task", type=str, default="anbn",
+                        choices=["anbn", "anbncn", "dyck1"],
+                        help="Formal language task (default: anbn)")
     # Mode
     parser.add_argument("--mode", type=str, default="basic",
                         choices=["basic", "shared"],
@@ -1157,6 +1235,9 @@ def _build_arg_parser(defaults=None):
     parser.add_argument("--m_max", type=int, default=10,
                         help="Max denominator in rational grid")
     # Architecture
+    parser.add_argument("--arch", type=str, default="lstm",
+                        choices=["lstm", "freeform"],
+                        help="Model architecture (lstm or freeform)")
     parser.add_argument("--hidden_size", type=int, default=3,
                         help="LSTM hidden size (3 matches Lan et al.)")
     # Data
@@ -1498,7 +1579,9 @@ def _main_inner(args, run_dir, loaded_params, start_epoch):
         print("Deterministic mode: ON  (--xla_gpu_deterministic_ops=true)")
     else:
         print("Deterministic mode: OFF (pass --deterministic for full reproducibility)")
-    print("Differentiable MDL for a^n b^n")
+    # Instantiate the task
+    task = get_task(args.task, p=args.p)
+    print(f"Differentiable MDL for {task.name} (alphabet size {task.num_symbols})")
     print(f"Mode: {args.mode}")
     if getattr(args, "config", None):
         print(f"Config: {args.config}")
@@ -1514,7 +1597,13 @@ def _main_inner(args, run_dir, loaded_params, start_epoch):
     _print_resolved_parameters(args)
 
     # --- Golden network baseline ---
-    golden_mdl, golden_result = evaluate_golden_baseline(args.test_max_n, args.p)
+    if has_golden(args.task):
+        golden_mdl, golden_result = evaluate_golden_baseline(
+            args.test_max_n, args.p, task_name=args.task,
+        )
+    else:
+        print(f"\n  No golden network for task {args.task!r} — skipping baseline.")
+        golden_mdl, golden_result = None, None
 
     # --- Build rational grid ---
     print(f"\nBuilding rational grid with n_max={args.n_max}, m_max={args.m_max}...")
@@ -1528,11 +1617,11 @@ def _main_inner(args, run_dir, loaded_params, start_epoch):
     print(f"  Codelength range: [{grid_codelengths.min():.0f}, {grid_codelengths.max():.0f}] bits")
 
     # --- Generate data ---
-    print(f"\nGenerating a^n b^n data (num_train={args.num_train}, p={args.p})...")
-    train_inputs, train_targets = make_anbn_dataset(
-        num_strings=args.num_train, p=args.p, seed=args.data_seed,
+    print(f"\nGenerating {task.name} data (num_train={args.num_train}, p={args.p})...")
+    train_inputs, train_targets = task.make_dataset(
+        num_strings=args.num_train, seed=args.data_seed,
     )
-    train_max_n = get_train_max_n(train_inputs)
+    train_max_n = get_train_max_n(train_inputs, task=task)
     print(f"  Training strings: {len(train_inputs)}")
     print(f"  Max n in training: {train_max_n}")
 
@@ -1543,26 +1632,23 @@ def _main_inner(args, run_dir, loaded_params, start_epoch):
     print(f"  After 95/5 split: {len(train_inputs)} train")
 
     # Structured validation set
-    val_inputs, val_targets = make_validation_set(
+    val_inputs, val_targets = task.make_validation_set(
         train_max_n, val_max_n=args.val_max_n, val_min_n=args.val_min_n,
     )
     if val_inputs:
-        first_val_n = len(val_inputs[0]) // 2
-        last_val_n = len(val_inputs[-1]) // 2
         print(
-            f"  Structured val set: {len(val_inputs)} strings "
-            f"(n={first_val_n}..{last_val_n})"
+            f"  Structured val set: {len(val_inputs)} strings"
         )
     else:
         print("  Structured val set: 0 strings")
 
     # Test set (skip generation for very large n - float64 simulation handles it)
     if args.test_max_n <= 10_000:
-        test_inputs, test_targets = make_test_set(max_n=args.test_max_n)
-        print(f"  Test set: {len(test_inputs)} strings (n=1..{args.test_max_n})")
+        test_inputs, test_targets = task.make_test_set(max_n=args.test_max_n)
+        print(f"  Test set: {len(test_inputs)} strings")
     else:
         test_inputs, test_targets = [], []
-        print(f"  Test set: n=1..{args.test_max_n} (will use float64 simulation)")
+        print(f"  Test set: skipped (will use float64 simulation)")
 
     # Pad training data
     x_train, y_train, mask_train = sequences_to_padded_arrays(
@@ -1572,16 +1658,29 @@ def _main_inner(args, run_dir, loaded_params, start_epoch):
     print(f"  Max sequence length (training): {max_seq_len}")
 
     # --- Create model ---
-    print(f"\nCreating GumbelSoftmaxLSTM (hidden={args.hidden_size}, grid_size={M})...")
-    model = GumbelSoftmaxLSTM(
-        hidden_size=args.hidden_size,
-        input_size=NUM_SYMBOLS,
-        output_size=NUM_SYMBOLS,
-        grid_values=grid_values,
-        grid_codelengths=grid_codelengths,
-        mode_forward=args.mode_forward,
-        init_cl_scale=args.init_cl_scale,
-    )
+    if args.arch == "freeform":
+        topology = get_freeform_topology(args.task)
+        print(f"\nCreating GumbelSoftmaxFreeFormRNN "
+              f"({topology.n_units} units, {topology.n_weights} params, grid_size={M})...")
+        model = GumbelSoftmaxFreeFormRNN(
+            topology=topology,
+            grid_values=grid_values,
+            grid_codelengths=grid_codelengths,
+            mode_forward=args.mode_forward,
+            init_cl_scale=args.init_cl_scale,
+        )
+    else:
+        topology = None
+        print(f"\nCreating GumbelSoftmaxLSTM (hidden={args.hidden_size}, grid_size={M})...")
+        model = GumbelSoftmaxLSTM(
+            hidden_size=args.hidden_size,
+            input_size=task.num_symbols,
+            output_size=task.num_symbols,
+            grid_values=grid_values,
+            grid_codelengths=grid_codelengths,
+            mode_forward=args.mode_forward,
+            init_cl_scale=args.init_cl_scale,
+        )
 
     rng = jrandom.PRNGKey(args.seed)
 
@@ -1651,6 +1750,8 @@ def _main_inner(args, run_dir, loaded_params, start_epoch):
         train_inputs, train_targets,
         golden_mdl, golden_result,
         best_epoch=best_epoch,
+        task=task,
+        topology=topology,
     )
     if run_dir is not None:
         save_results(run_dir, metrics)
@@ -1662,7 +1763,8 @@ def run_final_evaluation(args, state, best_params,
                          test_inputs, test_targets,
                          train_inputs, train_targets,
                          golden_mdl, golden_result,
-                         best_epoch=None):
+                         best_epoch=None, task=None,
+                         topology=None):
     """Run final test evaluation and print the comparison table.
 
     For test_max_n > 10000, uses efficient float64 simulation instead of
@@ -1685,15 +1787,28 @@ def run_final_evaluation(args, state, best_params,
         eval_model_params = eval_params
 
     # Decode discrete weights
-    discrete_weights = decode_weights({"params": eval_model_params}, grid_values)
+    if args.arch == "freeform":
+        discrete_weights = decode_freeform_weights({"params": eval_model_params}, grid_values)
+    else:
+        discrete_weights = decode_weights({"params": eval_model_params}, grid_values)
     n_nonzero = int(jnp.sum(discrete_weights != 0))
     print(f"\nDiscrete weights ({len(discrete_weights)} total, {n_nonzero} non-zero)")
 
     # Compute discrete MDL score (Lan-style)
-    total_hyp_bits = compute_discrete_mdl_score(eval_model_params, grid, grid_values)
-    arch_bits = integer_code_length(args.hidden_size)
-    total_mdl_bits = arch_bits + total_hyp_bits
-    print(f"  Discrete |H| (Lan): {total_mdl_bits} bits ({arch_bits} arch + {total_hyp_bits} weights)")
+    if args.arch == "freeform":
+        freeform_h = compute_freeform_discrete_h_bits(
+            eval_model_params, topology, grid, grid_values,
+        )
+        total_mdl_bits = freeform_h["total_bits"]
+        arch_bits = freeform_h["unit_count_bits"]
+        total_hyp_bits = total_mdl_bits - arch_bits
+        print(f"  Discrete |H| (freeform): {total_mdl_bits} bits "
+              f"({arch_bits} unit-count + {total_hyp_bits} per-unit)")
+    else:
+        total_hyp_bits = compute_discrete_mdl_score(eval_model_params, grid, grid_values)
+        arch_bits = integer_code_length(args.hidden_size)
+        total_mdl_bits = arch_bits + total_hyp_bits
+        print(f"  Discrete |H| (Lan): {total_mdl_bits} bits ({arch_bits} arch + {total_hyp_bits} weights)")
 
     if args.mode == "shared":
         from src.mdl.shared_weights import compute_p_base
@@ -1709,11 +1824,13 @@ def run_final_evaluation(args, state, best_params,
 
     # Test accuracy
     test_max_n = args.test_max_n
-    use_f64_eval = test_max_n > 10_000
+    use_f64_eval = (test_max_n > 10_000 and args.task == "anbn"
+                    and args.arch != "freeform")
 
     if use_f64_eval:
         # For very large n, use binary-search to efficiently find the
         # generalization boundary instead of testing all N strings.
+        # (aⁿbⁿ-specific float64 simulation)
         print(f"\nEvaluating on test set (n=1..{test_max_n}) using float64 simulation...")
         extracted = extract_weights(eval_model_params, grid, grid_values)
         print(f"  Finding generalization boundary (binary search)...")
@@ -1728,7 +1845,7 @@ def run_final_evaluation(args, state, best_params,
             all_correct = False
         mean_acc = our_n_perfect / test_max_n
     else:
-        print(f"\nEvaluating on test set (n=1..{test_max_n})...")
+        print(f"\nEvaluating on test set ({len(test_inputs)} strings)...")
         test_result = evaluate_deterministic_accuracy(
             state.apply_fn, eval_model_params, grid_values,
             test_inputs, test_targets, max_n=test_max_n,
@@ -1749,20 +1866,19 @@ def run_final_evaluation(args, state, best_params,
     trivial_hyp = n_params * 5  # all-zero weights, 5 bits each
     trivial_mdl = arch_bits + trivial_hyp
 
-    golden_gen_n = (
-        test_max_n if golden_result["all_correct"]
-        else (golden_result["first_failure_n"] - 1)
-    )
-    golden_n_perfect = golden_gen_n
-
     print("\n" + "=" * 70)
     print("COMPARISON TABLE (cf. Lan et al. 2024, Table 1)")
     print("=" * 70)
     print(f"{'Method':<30} {'|H| (bits)':>10} {'gen_n':>8} {'n_perfect':>16}")
     print("-" * 70)
-    print(f"{'Lan et al. golden':<30} {golden_mdl['total_bits']:>10d} {golden_gen_n:>8d} "
-          f"{golden_n_perfect:>10d}/{test_max_n}")
-    print(f"{'Trivial (always-b)':<30} {trivial_mdl:>10d} {0:>8d} "
+    if golden_result is not None:
+        golden_gen_n = (
+            test_max_n if golden_result["all_correct"]
+            else (golden_result["first_failure_n"] - 1)
+        )
+        print(f"{'Golden baseline':<30} {golden_mdl['total_bits']:>10d} {golden_gen_n:>8d} "
+              f"{golden_gen_n:>10d}/{test_max_n}")
+    print(f"{'Trivial (uniform)':<30} {trivial_mdl:>10d} {0:>8d} "
           f"{0:>10d}/{test_max_n}")
     mode_name = "Ours (basic MDL)" if args.mode == "basic" else "Ours (shared MDL)"
     print(f"{mode_name:<30} {total_mdl_bits:>10d} {our_gen_n:>8d} "
@@ -1774,18 +1890,40 @@ def run_final_evaluation(args, state, best_params,
     print("PAPER-COMPARABLE METRICS (Abudy et al. 2025)")
     print("=" * 70)
 
-    # Golden baselines
-    print("  Evaluating golden baselines...")
-    golden_opt_test = compute_optimal_dh_test(
-        max_n=test_max_n, p=args.p, batch_size=64, verbose=True,
-    )
-    print(f"  Golden test |D:H|: {golden_opt_test['data_dh_bits']:.4f} bits")
-    print(f"  Golden |H| (LSTM): {golden_opt_test['h_bits']} bits")
+    # Golden baselines (task-agnostic via registry)
+    # Use freeform golden when arch=freeform (for apples-to-apples comparison)
+    golden_key = (f"{args.task}_freeform"
+                  if args.arch == "freeform" and has_golden(f"{args.task}_freeform")
+                  else args.task)
+    if has_golden(golden_key):
+        golden_spec = get_golden(golden_key)
+        golden_params = golden_spec.build_params(p=args.p)
+        golden_mdl = golden_spec.mdl_score(p=args.p)
 
-    golden_opt_train = compute_optimal_dh_train(
-        train_inputs, train_targets, p=args.p, batch_size=64, verbose=True,
-    )
-    print(f"  Golden train |D:H|: {golden_opt_train['train_dh_data_bits']:.2f} bits")
+        def golden_fwd(x):
+            return golden_spec.forward(golden_params, x)
+
+        print("  Evaluating golden baselines...")
+        golden_opt_test = compute_grammar_weighted_nll_bits_task(
+            golden_fwd, task, batch_size=64, verbose=True,
+            max_n=test_max_n,
+        )
+        golden_test_dh = golden_opt_test["data_dh_bits"]
+        golden_h_bits = golden_mdl["total_bits"]
+        print(f"  Golden test |D:H|: {golden_test_dh:.4f} bits")
+        print(f"  Golden |H|: {golden_h_bits} bits")
+
+        golden_train_result = compute_train_dh(
+            golden_fwd, train_inputs, train_targets, batch_size=64,
+            verbose=True,
+        )
+        golden_train_dh = golden_train_result["train_dh_data_bits"]
+        print(f"  Golden train |D:H|: {golden_train_dh:.2f} bits")
+    else:
+        print(f"  No golden network for {golden_key} — skipping golden baselines")
+        golden_test_dh = None
+        golden_h_bits = None
+        golden_train_dh = None
 
     # Trained network |D:H| via discrete forward pass
     def our_discrete_fwd(x):
@@ -1795,9 +1933,9 @@ def run_final_evaluation(args, state, best_params,
         return logits_out
 
     print("  Evaluating trained network...")
-    our_test_result = compute_grammar_weighted_nll_bits(
-        our_discrete_fwd, max_n=test_max_n, p=args.p, batch_size=64,
-        verbose=True,
+    our_test_result = compute_grammar_weighted_nll_bits_task(
+        our_discrete_fwd, task, batch_size=64, verbose=True,
+        max_n=test_max_n,
     )
     our_test_data_dh = our_test_result["data_dh_bits"]
 
@@ -1807,37 +1945,46 @@ def run_final_evaluation(args, state, best_params,
     )
     our_train_data_dh = our_train_result["train_dh_data_bits"]
 
-    our_h = compute_trained_h_bits(
-        eval_model_params, grid_codelengths, args.hidden_size,
-    )
+    if args.arch == "freeform":
+        our_h = {
+            "h_bits": total_mdl_bits,
+            "arch_bits": arch_bits,
+            "weight_bits": total_hyp_bits,
+        }
+    else:
+        our_h = compute_trained_h_bits(
+            eval_model_params, grid_codelengths, args.hidden_size,
+        )
 
-    delta_test = compute_delta_pct(
-        our_test_data_dh, golden_opt_test["data_dh_bits"],
-    )
-    delta_train = compute_delta_pct(
-        our_train_data_dh, golden_opt_train["train_dh_data_bits"],
-    )
+    if golden_test_dh is not None:
+        delta_test = compute_delta_pct(our_test_data_dh, golden_test_dh)
+        delta_train = compute_delta_pct(our_train_data_dh, golden_train_dh)
 
-    print(f"\n  Our test |D:H|:  {our_test_data_dh:.4f} bits  "
-          f"(Δ_test = {delta_test:+.1f}%)")
-    print(f"  Our train |D:H|: {our_train_data_dh:.2f} bits  "
-          f"(Δ_train = {delta_train:+.1f}%)")
-    print(f"  Our |H|:         {our_h['h_bits']} bits "
-          f"({our_h['arch_bits']} arch + {our_h['weight_bits']} weights)")
+        print(f"\n  Our test |D:H|:  {our_test_data_dh:.4f} bits  "
+              f"(Δ_test = {delta_test:+.1f}%)")
+        print(f"  Our train |D:H|: {our_train_data_dh:.2f} bits  "
+              f"(Δ_train = {delta_train:+.1f}%)")
+        print(f"  Our |H|:         {our_h['h_bits']} bits "
+              f"({our_h['arch_bits']} arch + {our_h['weight_bits']} weights)")
 
-    # Summary table
-    table = format_abudy_comparison_table(
-        our_test_data_dh=our_test_data_dh,
-        our_train_data_dh=our_train_data_dh,
-        our_h_bits=our_h["h_bits"],
-        opt_test_data_dh=golden_opt_test["data_dh_bits"],
-        opt_train_data_dh=golden_opt_train["train_dh_data_bits"],
-        golden_h_bits=golden_opt_test["h_bits"],
-    )
-    print(f"\n{table}")
+        table = format_abudy_comparison_table(
+            our_test_data_dh=our_test_data_dh,
+            our_train_data_dh=our_train_data_dh,
+            our_h_bits=our_h["h_bits"],
+            opt_test_data_dh=golden_test_dh,
+            opt_train_data_dh=golden_train_dh,
+            golden_h_bits=golden_h_bits,
+        )
+        print(f"\n{table}")
+    else:
+        print(f"\n  Our test |D:H|:  {our_test_data_dh:.4f} bits")
+        print(f"  Our train |D:H|: {our_train_data_dh:.2f} bits")
+        print(f"  Our |H|:         {our_h['h_bits']} bits "
+              f"({our_h['arch_bits']} arch + {our_h['weight_bits']} weights)")
 
-    # --- Analytical network analysis ---
-    if getattr(args, "analyze", False):
+    # --- Analytical network analysis (aⁿbⁿ-specific) ---
+    if (getattr(args, "analyze", False) and args.task == "anbn"
+            and args.arch != "freeform"):
         analysis_result = analyze_model(
             eval_model_params, grid, grid_values,
             max_test_n=args.analyze_max_n, p=args.p,
@@ -1845,6 +1992,8 @@ def run_final_evaluation(args, state, best_params,
 
     return {
         "mode": args.mode,
+        "task": args.task,
+        "arch": args.arch,
         "gen_n": int(our_gen_n),
         "n_perfect": int(our_n_perfect),
         "total_mdl_bits": int(total_mdl_bits),
@@ -1855,12 +2004,15 @@ def run_final_evaluation(args, state, best_params,
         # Paper-comparable metrics
         "test_data_dh_bits": float(our_test_data_dh),
         "train_data_dh_bits": float(our_train_data_dh),
-        "delta_test_pct": float(delta_test),
-        "delta_train_pct": float(delta_train),
-        "golden_test_data_dh_bits": float(golden_opt_test["data_dh_bits"]),
-        "golden_train_data_dh_bits": float(golden_opt_train["train_dh_data_bits"]),
-        "golden_h_bits": int(golden_opt_test["h_bits"]),
     }
+    if golden_test_dh is not None:
+        metrics["delta_test_pct"] = float(compute_delta_pct(our_test_data_dh, golden_test_dh))
+        metrics["delta_train_pct"] = float(compute_delta_pct(our_train_data_dh, golden_train_dh))
+        metrics["golden_test_data_dh_bits"] = float(golden_test_dh)
+        metrics["golden_train_data_dh_bits"] = float(golden_train_dh)
+        metrics["golden_h_bits"] = int(golden_h_bits)
+
+    return metrics
 
 
 if __name__ == "__main__":
