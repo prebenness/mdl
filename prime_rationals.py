@@ -773,7 +773,6 @@ def make_anbn_qat_train_step(lambda_mdl, n_train, P, mode, mu,
                 "data_nll": data_nll,
                 "mdl_reg": mdl_reg,
                 "int_pen": int_pen,
-                "mode": mode,
             }
 
         (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
